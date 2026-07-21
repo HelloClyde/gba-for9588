@@ -323,8 +323,37 @@ index 625f46e..4225eb9 100644
  #define ROM_BRANCH_HASH_SIZE   (1 << ROM_BRANCH_HASH_BITS)
  
  /* RFU Multiplayer config, do not mess around too much with it */
+diff --git a/input.c b/input.c
+index 1574e51..f2cbef3 100644
+--- a/input.c
++++ b/input.c
+@@ -51,7 +51,9 @@ static void trigger_key(u32 key)
+       if(key_intersection == (p1_cnt & 0x3FF))
+       {
+         flag_interrupt(IRQ_KEYPAD);
++#if !defined(BBK9588)
+         check_and_raise_interrupts();
++#endif
+       }
+     }
+     else
+@@ -59,7 +61,9 @@ static void trigger_key(u32 key)
+       if(key_intersection)
+       {
+         flag_interrupt(IRQ_KEYPAD);
++#if !defined(BBK9588)
+         check_and_raise_interrupts();
++#endif
+       }
+     }
+   }
+@@ -211,4 +215,3 @@ unsigned input_write_savestate(u8 *dst)
+   bson_finish_document(dst, wbptr1);
+   return (unsigned int)(dst - startp);
+ }
+-
 diff --git a/libretro/libretro.c b/libretro/libretro.c
-index 5f02c09..c555c3a 100644
+index 5f02c09..365bf82 100644
 --- a/libretro/libretro.c
 +++ b/libretro/libretro.c
 @@ -120,6 +120,25 @@ static void info_msg(const char* text)
@@ -364,7 +393,7 @@ index 5f02c09..c555c3a 100644
     audio_samples_per_frame   = (float)(GBA_SOUND_FREQUENCY) / (float)(GBA_FPS);
     audio_samples_accumulator = 0.0f;
     audio_sample_buffer_size  = ((u32)audio_samples_per_frame + 1) * 2;
-@@ -647,6 +667,7 @@ void retro_init(void)
+@@ -647,6 +670,7 @@ void retro_init(void)
  
     init_gamepak_buffer();
     init_sound();
@@ -372,7 +401,7 @@ index 5f02c09..c555c3a 100644
  
     if(!gba_screen_pixels)
  #ifdef _3DS
-@@ -693,8 +714,11 @@ void retro_deinit(void)
+@@ -693,8 +717,11 @@ void retro_deinit(void)
  {
     perf_cb.perf_log();
     memory_term();
@@ -384,7 +413,7 @@ index 5f02c09..c555c3a 100644
     unmap_jit_block(rom_translation_cache, ROM_TRANSLATION_CACHE_SIZE + RAM_TRANSLATION_CACHE_SIZE);
  #endif
  #if defined(_3DS) && defined(HAVE_DYNAREC)
-@@ -1200,7 +1224,16 @@ bool retro_load_game(const struct retro_game_info* info)
+@@ -1200,7 +1227,16 @@ bool retro_load_game(const struct retro_game_info* info)
       memcpy(bios_rom, open_gba_bios_rom, sizeof(bios_rom));
     }
  
@@ -402,18 +431,33 @@ index 5f02c09..c555c3a 100644
     if (load_gamepak(info, info->path, rtc_mode, rumble_mode, serial_setting) != 0)
     {
        error_msg("Could not load the game file.");
-@@ -1294,8 +1327,10 @@ void retro_run(void)
+@@ -1290,12 +1326,25 @@ size_t retro_get_memory_size(unsigned id)
+    return 0;
+ }
+ 
++#if defined(BBK9588)
++void bbk9588_poll_input(void)
++{
++   if (input_poll_cb)
++      input_poll_cb();
++   update_input();
++}
++#endif
++
+ void retro_run(void)
  {
     bool updated = false;
  
 +   BBK_RUN_TRACE("RUN_ENTER", 1);
++#if !defined(BBK9588)
     input_poll_cb();
     update_input();
++#endif
 +   BBK_RUN_TRACE("RUN_INPUT_DONE", 2);
  
     rumble_frame_reset();
  
-@@ -1370,6 +1405,7 @@ void retro_run(void)
+@@ -1370,6 +1419,7 @@ void retro_run(void)
     }
  
     /* This runs just a frame */
@@ -421,7 +465,7 @@ index 5f02c09..c555c3a 100644
     #ifdef HAVE_DYNAREC
     if (dynarec_enable)
        execute_arm_translate(execute_cycles);
-@@ -1380,6 +1416,7 @@ void retro_run(void)
+@@ -1380,6 +1430,7 @@ void retro_run(void)
        clear_gamepak_stickybits();
        execute_arm(execute_cycles);
     }
@@ -429,7 +473,7 @@ index 5f02c09..c555c3a 100644
  
     if (rumble_cb) {
       // TODO: Add some user-option to select a rumble policy
-@@ -1388,8 +1425,12 @@ void retro_run(void)
+@@ -1388,8 +1439,12 @@ void retro_run(void)
       rumble_cb(0, RETRO_RUMBLE_STRONG, MIN(strength, 0xffff) / 2);
     }
  
@@ -442,7 +486,7 @@ index 5f02c09..c555c3a 100644
  
     switch (serial_mode) {
     case SERIAL_MODE_RFU:
-@@ -1402,6 +1446,11 @@ void retro_run(void)
+@@ -1402,6 +1457,11 @@ void retro_run(void)
  
     if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
        check_variables(false);
@@ -454,6 +498,54 @@ index 5f02c09..c555c3a 100644
  }
  
  unsigned retro_api_version(void)
+diff --git a/main.c b/main.c
+index 6fb26fc..62a39cb 100644
+--- a/main.c
++++ b/main.c
+@@ -36,6 +36,12 @@ char main_path[512];
+ 
+ static u32 random_state = 0;
+ 
++#if defined(BBK9588)
++#define BBK9588_INPUT_POLL_CYCLES 8192u
++static u32 bbk9588_input_cycle_accumulator;
++extern void bbk9588_poll_input(void);
++#endif
++
+ // Generate 16 random bits.
+ u16 rand_gen() {
+   random_state = ((random_state * 1103515245) + 12345) & 0x7fffffff;
+@@ -110,6 +116,9 @@ void init_main(void)
+   cpu_ticks = 0;
+   execute_cycles = 960;
+   video_count = 960;
++#if defined(BBK9588)
++  bbk9588_input_cycle_accumulator = BBK9588_INPUT_POLL_CYCLES;
++#endif
+ 
+ #ifdef HAVE_DYNAREC
+   init_dynarec_caches();
+@@ -137,6 +146,15 @@ u32 function_cc update_gba(int remaining_cycles)
+ 
+     remaining_cycles = 0;
+ 
++#if defined(BBK9588)
++    bbk9588_input_cycle_accumulator += completed_cycles;
++    if (bbk9588_input_cycle_accumulator >= BBK9588_INPUT_POLL_CYCLES)
++    {
++      bbk9588_input_cycle_accumulator %= BBK9588_INPUT_POLL_CYCLES;
++      bbk9588_poll_input();
++    }
++#endif
++
+     // Timers can trigger DMA (usually sound) and consume cycles
+     dma_cycles = update_timers(&irq_raised, completed_cycles);
+     // Check for serial port IRQs as well.
+@@ -452,4 +470,3 @@ unsigned main_write_savestate(u8* dst)
+ 
+   return (unsigned int)(dst - startp);
+ }
+-
 diff --git a/mips/mips_emit.h b/mips/mips_emit.h
 index 79d5183..e374916 100644
 --- a/mips/mips_emit.h
@@ -569,7 +661,7 @@ index 79d5183..e374916 100644
      mips_emit_jr(reg_rv);                       // Jump directly to target for speed
      mips_emit_cache(0x08, mips_reg_ra, -8);
 diff --git a/mips/mips_stub.S b/mips/mips_stub.S
-index 34b0446..90778a3 100644
+index 34b0446..62e9a4b 100644
 --- a/mips/mips_stub.S
 +++ b/mips/mips_stub.S
 @@ -25,7 +25,11 @@
@@ -658,7 +750,9 @@ index 34b0446..90778a3 100644
  
  # Perform an indirect branch.
  
-@@ -344,8 +395,15 @@ cpu_sleep_loop:
+@@ -342,8 +393,15 @@ defsymbl(write_io_epilogue)
+ 
+ cpu_sleep_loop:
    move $4, reg_cycles             # Remaining cycles as asg0
 +#if defined(BBK9588)
 +  bbk_restore_host_irqs            # Service firmware IRQs while the GBA CPU sleeps
@@ -672,8 +766,6 @@ index 34b0446..90778a3 100644
    bltz $2, return_to_main         # Exit if a frame is complete (bit 31 is set)
  
    # since no frame was completed, this means CPU is active again.
-   # Fall through to lookup_pc to resume execution
-   and reg_cycles, $2, 0x7FFF      # update new cycle count (ret value)
 @@ -522,6 +580,17 @@ defsymbl(execute_arm_translate_internal)
    REG_S $s7, 11*SZREG($sp)
    REG_S $fp, 12*SZREG($sp)

@@ -107,7 +107,10 @@ if ($Target -eq 'm0_smoke') {
         (Join-Path $gpspRoot 'gba_cc_lut.c'),
         (Join-Path $gpspRoot 'libretro\libretro-common\compat\compat_strl.c')
     )
-    if ($Target -in @('gpsp_dynarec', 'gpsp_app', 'gpsp_app_cpu_test')) {
+    if ($Target -in @(
+        'gpsp_dynarec', 'gpsp_app_interpreter', 'gpsp_app',
+        'gpsp_app_cpu_test'
+    )) {
         $patchedGpspRoot = Join-Path $buildRoot 'patched-gpsp'
         $patchedMipsRoot = Join-Path $patchedGpspRoot 'mips'
         $patchedLibretroRoot = Join-Path $patchedGpspRoot 'libretro'
@@ -120,7 +123,8 @@ if ($Target -eq 'm0_smoke') {
         Copy-Item -LiteralPath (Join-Path $gpspRoot 'cpu_threaded.c') `
             -Destination (Join-Path $patchedGpspRoot 'cpu_threaded.c') -Force
         foreach ($patchedSource in @(
-            'gba_memory.c', 'sound.c', 'video.cc', 'libretro\libretro.c'
+            'gba_memory.c', 'input.c', 'main.c', 'sound.c', 'video.cc',
+            'libretro\libretro.c'
         )) {
             Copy-Item -LiteralPath (Join-Path $gpspRoot $patchedSource) `
                 -Destination (Join-Path $patchedGpspRoot $patchedSource) -Force
@@ -141,6 +145,8 @@ if ($Target -eq 'm0_smoke') {
         }
         $sourceOverrides = @{
             (Join-Path $gpspRoot 'gba_memory.c') = Join-Path $patchedGpspRoot 'gba_memory.c'
+            (Join-Path $gpspRoot 'input.c') = Join-Path $patchedGpspRoot 'input.c'
+            (Join-Path $gpspRoot 'main.c') = Join-Path $patchedGpspRoot 'main.c'
             (Join-Path $gpspRoot 'sound.c') = Join-Path $patchedGpspRoot 'sound.c'
             (Join-Path $gpspRoot 'video.cc') = Join-Path $patchedGpspRoot 'video.cc'
             (Join-Path $gpspRoot 'libretro\libretro.c') =
@@ -153,16 +159,20 @@ if ($Target -eq 'm0_smoke') {
                 $_
             }
         })
-        $sources += @(
-            'src\platform\bbk9588\cache.S',
-            'src\platform\bbk9588\jit_memory.c',
-            (Join-Path $patchedGpspRoot 'cpu_threaded.c'),
-            (Join-Path $patchedGpspRoot 'mips\mips_stub.S')
-        )
+        if ($Target -in @('gpsp_dynarec', 'gpsp_app', 'gpsp_app_cpu_test')) {
+            $sources += @(
+                'src\platform\bbk9588\cache.S',
+                'src\platform\bbk9588\jit_memory.c',
+                (Join-Path $patchedGpspRoot 'cpu_threaded.c'),
+                (Join-Path $patchedGpspRoot 'mips\mips_stub.S')
+            )
+        }
         $title = if ($Target -eq 'gpsp_app') {
             $formalGbaTitle
         } elseif ($Target -eq 'gpsp_app_cpu_test') {
             'GBA EVENT WAKE'
+        } elseif ($Target -eq 'gpsp_app_interpreter') {
+            'GBA Emulator INT'
         } else {
             'GBA gpSP DRC'
         }
