@@ -16,6 +16,18 @@
 或直接下载 [GBA.bda](https://github.com/HelloClyde/gba-for9588/releases/latest/download/GBA.bda)。
 发布页同时提供 `GBA.bda.sha256` 校验文件。
 
+## 真机演示
+
+<p align="center">
+  <a href="https://github.com/HelloClyde/gba-for9588/releases/download/v0.1.0/GBA-for-BBK9588-demo.mp4">
+    <img src="assets/demo-preview.webp" width="300" alt="GBA for BBK 9588 真机演示">
+  </a>
+</p>
+
+点击动态预览观看完整的 43 秒真机演示，内容包括选择 ROM、启动游戏、触摸控制和实际运行。
+完整视频采用 H.264/AAC 编码，大小约 3.8 MB，也可从
+[v0.1.0 Release](https://github.com/HelloClyde/gba-for9588/releases/tag/v0.1.0) 下载。
+
 ## 功能
 
 - gpSP MIPS32 dynamic recompiler，以及便于诊断的解释器目标
