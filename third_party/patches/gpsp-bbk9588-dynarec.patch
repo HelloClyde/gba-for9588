@@ -1,0 +1,831 @@
+diff --git a/cpu.h b/cpu.h
+index dd6cb89..872dee1 100644
+--- a/cpu.h
++++ b/cpu.h
+@@ -162,12 +162,17 @@ extern u32 idle_loop_target_pc;
+ extern u32 translation_gate_targets;
+ extern u32 translation_gate_target_pc[MAX_TRANSLATION_GATES];
+ 
++#if defined(BBK9588)
++extern u32 *rom_branch_hash;
++#else
+ extern u32 rom_branch_hash[ROM_BRANCH_HASH_SIZE];
++#endif
+ 
+ void flush_translation_cache_rom(void);
+ void flush_translation_cache_ram(void);
+ void dump_translation_cache(void);
+ void init_dynarec_caches(void);
++void term_dynarec_caches(void);
+ void flush_dynarec_caches(void);
+ void init_emitter(bool);
+ void init_bios_hooks(void);
+diff --git a/cpu_threaded.c b/cpu_threaded.c
+index 8942ab3..f9aa383 100644
+--- a/cpu_threaded.c
++++ b/cpu_threaded.c
+@@ -75,7 +75,11 @@ typedef struct
+   u32 next_entry;
+ } hashhdr_type;
+ 
++#if defined(BBK9588)
++u32 *rom_branch_hash;
++#else
+ u32 rom_branch_hash[ROM_BRANCH_HASH_SIZE];
++#endif
+ 
+ typedef struct
+ {
+@@ -224,7 +228,12 @@ typedef struct
+ 
+ /* Cache invalidation */
+ 
+-#if defined(PSP)
++#if defined(BBK9588)
++  extern void bda_cache_sync(void *baseaddr, void *endptr);
++  void platform_cache_sync(void *baseaddr, void *endptr) {
++    bda_cache_sync(baseaddr, endptr);
++  }
++#elif defined(PSP)
+   void platform_cache_sync(void *baseaddr, void *endptr) {
+     sceKernelDcacheWritebackRange(baseaddr, ((char*)endptr) - ((char*)baseaddr));
+     sceKernelIcacheInvalidateRange(baseaddr, ((char*)endptr) - ((char*)baseaddr));
+@@ -3383,14 +3392,27 @@ void flush_translation_cache_rom(void)
+   last_rom_translation_ptr = &rom_translation_cache[rom_cache_watermark];
+   rom_translation_ptr      = &rom_translation_cache[rom_cache_watermark];
+ 
+-  memset(rom_branch_hash, 0, sizeof(rom_branch_hash));
++#if defined(BBK9588)
++  if (!rom_branch_hash)
++    rom_branch_hash = (u32*)malloc(ROM_BRANCH_HASH_SIZE * sizeof(*rom_branch_hash));
++  if (!rom_branch_hash)
++    return;
++#endif
++  memset(rom_branch_hash, 0, ROM_BRANCH_HASH_SIZE * sizeof(*rom_branch_hash));
+ }
+ 
+ void init_dynarec_caches(void)
+ {
++#if defined(BBK9588)
++  if (!rom_branch_hash)
++    rom_branch_hash = (u32*)malloc(ROM_BRANCH_HASH_SIZE * sizeof(*rom_branch_hash));
++  if (!rom_branch_hash)
++    return;
++#endif
++
+   /* Initialize caches so that we can start initalizing the emitter. */
+   rom_translation_ptr = last_rom_translation_ptr = &rom_translation_cache[0];
+-  memset(rom_branch_hash, 0, sizeof(rom_branch_hash));
++  memset(rom_branch_hash, 0, ROM_BRANCH_HASH_SIZE * sizeof(*rom_branch_hash));
+ 
+   ram_translation_ptr = last_ram_translation_ptr = &ram_translation_cache[0];
+   memset(iwram, 0, 0x8000);
+@@ -3402,6 +3424,14 @@ void init_dynarec_caches(void)
+   iwram_code_max = 0x8000;
+ }
+ 
++void term_dynarec_caches(void)
++{
++#if defined(BBK9588)
++  free(rom_branch_hash);
++  rom_branch_hash = NULL;
++#endif
++}
++
+ void flush_dynarec_caches(void)
+ {
+   /* Flush ROM and RAM caches. */
+diff --git a/gba_memory.c b/gba_memory.c
+index f89567a..ab50f83 100644
+--- a/gba_memory.c
++++ b/gba_memory.c
+@@ -18,6 +18,14 @@
+  */
+ 
+ #include "common.h"
++
++#if defined(BBK9588)
++extern void bbk9588_load_trace(const char *stage, unsigned value);
++#define BBK_LOAD_TRACE(stage, value) bbk9588_load_trace((stage), (value))
++static unsigned bbk9588_page_trace_count;
++#else
++#define BBK_LOAD_TRACE(stage, value) ((void)0)
++#endif
+ #include "streams/file_stream.h"
+ 
+ /* Sound */
+@@ -342,7 +350,11 @@ const u32 def_seq_cycles[16][2] =
+ u8 bios_rom[1024 * 16];
+ 
+ // Up to 128kb, store SRAM, flash ROM, or EEPROM here.
++#if defined(BBK9588)
++u8 *gamepak_backup;
++#else
+ u8 gamepak_backup[1024 * 128];
++#endif
+ 
+ u32 dma_bus_val;
+ dma_transfer_type dma[4];
+@@ -2237,6 +2249,18 @@ static u32 evict_gamepak_page(void)
+ u8 *load_gamepak_page(u32 physical_index)
+ {
+   u32 rom_blocks = gamepak_size >> 15;
++  u32 file_index;
++  u32 target;
++  int64_t seek_result;
++  int64_t read_len;
++#if defined(BBK9588)
++  bool trace_page = bbk9588_page_trace_count < 4;
++  if (trace_page)
++  {
++    bbk9588_page_trace_count++;
++    BBK_LOAD_TRACE("PAGE_INDEX", physical_index);
++  }
++#endif
+   if (rom_blocks == 0)
+     return &gamepak_buffers[0][0];
+ 
+@@ -2253,19 +2277,51 @@ u8 *load_gamepak_page(u32 physical_index)
+   // Fill in the entry
+   gamepak_blk_queue[entry].phy_rom = physical_index;
+ 
+-  u32 file_index = physical_index;
++  file_index = physical_index;
+   if (gamepak_mirror_1m && gamepak_file_blocks != 0)
+     file_index %= gamepak_file_blocks;
+ 
+-  filestream_seek(gamepak_file_large, file_index * (32 * 1024), SEEK_SET);
++  target = file_index * (32 * 1024);
++#if defined(BBK9588)
++  if (trace_page)
++    BBK_LOAD_TRACE("PAGE_SEEK_BEGIN", target);
++#endif
++  seek_result = filestream_seek(gamepak_file_large, target, SEEK_SET);
++#if defined(BBK9588)
++  if (trace_page)
++    BBK_LOAD_TRACE("PAGE_SEEK_END", (u32)seek_result);
++#endif
++  if (seek_result != (int64_t)target)
+   {
+-    u32 read_len = (u32)filestream_read(gamepak_file_large, swap_location, (32 * 1024));
+-    if (read_len < (32 * 1024))
++    memset(swap_location, 0xFF, 32 * 1024);
++    BBK_LOAD_TRACE("PAGE_SEEK_ERROR", (u32)seek_result);
++  }
++  else
++  {
++    read_len = filestream_read(gamepak_file_large, swap_location, 32 * 1024);
++#if defined(BBK9588)
++    if (trace_page)
++      BBK_LOAD_TRACE("PAGE_READ_END", (u32)read_len);
++#endif
++    if (read_len < 0)
++    {
++      memset(swap_location, 0xFF, 32 * 1024);
++      BBK_LOAD_TRACE("PAGE_READ_ERROR", (u32)read_len);
++    }
++    else if (read_len < (32 * 1024))
+       memset(swap_location + read_len, 0xFF, (32 * 1024) - read_len);
+   }
+ 
+   // Map it to the read handlers now
++#if defined(BBK9588)
++  if (trace_page)
++    BBK_LOAD_TRACE("PAGE_MAP_BEGIN", entry);
++#endif
+   map_rom_entry(read, physical_index, swap_location, rom_blocks);
++#if defined(BBK9588)
++  if (trace_page)
++    BBK_LOAD_TRACE("PAGE_DONE", physical_index);
++#endif
+ 
+   // When mapping page 0, we might need to reflect the GPIO regs.
+   if (physical_index == 0)
+@@ -2277,6 +2333,12 @@ u8 *load_gamepak_page(u32 physical_index)
+ void init_gamepak_buffer(void)
+ {
+   unsigned i;
++#if defined(BBK9588)
++  bbk9588_page_trace_count = 0;
++  if (!gamepak_backup)
++    gamepak_backup = (u8*)malloc(GAMEPAK_BACKUP_SIZE);
++#endif
++
+   // Try to allocate up to 32 blocks of 1MB each
+   gamepak_buffer_count = 0;
+   while (gamepak_buffer_count < ROM_BUFFER_SIZE)
+@@ -2390,6 +2452,14 @@ void memory_term(void)
+     gamepak_mini_rom = NULL;
+   }
+   gamepak_mini_materialized = false;
++
++#if defined(BBK9588)
++  if (gamepak_backup)
++  {
++    free(gamepak_backup);
++    gamepak_backup = NULL;
++  }
++#endif
+ }
+ 
+ bool memory_check_savestate(const u8 *src)
+@@ -2593,6 +2663,7 @@ static s32 load_gamepak_raw(const char *name)
+   int64_t fsize;
+   gamepak_file_large = filestream_open(name, RETRO_VFS_FILE_ACCESS_READ,
+                                        RETRO_VFS_FILE_ACCESS_HINT_NONE);
++  BBK_LOAD_TRACE("OPEN", gamepak_file_large != NULL);
+   if(gamepak_file_large)
+   {
+     if (gamepak_mini_rom)
+@@ -2614,6 +2685,7 @@ static s32 load_gamepak_raw(const char *name)
+       return -1;
+     }
+     raw_size = (u32)fsize;
++    BBK_LOAD_TRACE("SIZE", raw_size);
+ 
+     // Round size to 32KB pages
+     raw_size = (raw_size + 0x7FFF) & ~0x7FFF;
+@@ -2683,6 +2755,7 @@ static s32 load_gamepak_raw(const char *name)
+       // Load 1MB chunk and map it
+       {
+         u32 read_len = (u32)filestream_read(gamepak_file_large, gamepak_buffers[i], gamepak_buffer_blocksize);
++        BBK_LOAD_TRACE("BLOCK", i + 1);
+         if (read_len < gamepak_buffer_blocksize)
+           memset(gamepak_buffers[i] + read_len, 0xFF, gamepak_buffer_blocksize - read_len);
+       }
+@@ -2695,8 +2768,9 @@ static s32 load_gamepak_raw(const char *name)
+         // Map it to the read handlers now
+         map_rom_entry(read, phyn, blkptr, rom_blocks);
+       }
+-    } 
++    }
+ 
++    BBK_LOAD_TRACE("RAW_DONE", ldblks);
+     return 0;
+   }
+ 
+@@ -2874,6 +2948,7 @@ u32 load_gamepak(const struct retro_game_info* info, const char *name,
+ 
+    if (load_gamepak_raw(name))
+       return -1;
++   BBK_LOAD_TRACE("RAW_RETURN", gamepak_size);
+ 
+    gamepak_header_nonstandard =
+       (gamepak_buffers[0][3] != 0xEA) || (gamepak_buffers[0][0xB2] != 0x96);
+@@ -2916,6 +2991,7 @@ u32 load_gamepak(const struct retro_game_info* info, const char *name,
+       u32 scan_size = gamepak_size < (1024*1024) ? gamepak_size : (1024*1024);
+       detect_backup_subcircuit(gamepak_buffers[0], scan_size);
+    }
++   BBK_LOAD_TRACE("CONFIG_DONE", backup_type_reset);
+ 
+    bool is_128k_flash = (backup_type_reset == BACKUP_FLASH && flash_bank_cnt == FLASH_SIZE_128KB);
+    bool is_pokemon_engine = rom_is_pokemon_family(gamepak_buffers[0]) || is_128k_flash;
+@@ -2991,6 +3067,7 @@ u32 load_gamepak(const struct retro_game_info* info, const char *name,
+     * rtc_base_time, both of which are persisted in the savestate. */
+    rtc_init_base_time();
+ 
++   BBK_LOAD_TRACE("RETURN", gamepak_size);
+    return 0;
+ }
+ 
+diff --git a/gba_memory.h b/gba_memory.h
+index 50472a3..71e0b5b 100644
+--- a/gba_memory.h
++++ b/gba_memory.h
+@@ -309,7 +309,12 @@ extern u32 sram_bankcount;
+ extern u32 flash_bank_cnt;
+ extern u32 eeprom_size;
+ 
++#define GAMEPAK_BACKUP_SIZE (1024 * 128)
++#if defined(BBK9588)
++extern u8 *gamepak_backup;
++#else
+ extern u8 gamepak_backup[1024 * 128];
++#endif
+ 
+ // Page sticky bit routines
+ extern u32 gamepak_sticky_bit[1024/32];
+diff --git a/gpsp_config.h b/gpsp_config.h
+index 625f46e..4225eb9 100644
+--- a/gpsp_config.h
++++ b/gpsp_config.h
+@@ -24,8 +24,12 @@
+    instruction can take. STM/LDM are tipically the biggest ones */
+ #define TRANSLATION_CACHE_LIMIT_THRESHOLD (1024 * 2)
+ 
+-/* Hash table size for ROM trans cache lookups */
++/* Hash table size for ROM trans cache lookups. */
++#if defined(BBK9588)
++#define ROM_BRANCH_HASH_BITS                           14
++#else
+ #define ROM_BRANCH_HASH_BITS                           16
++#endif
+ #define ROM_BRANCH_HASH_SIZE   (1 << ROM_BRANCH_HASH_BITS)
+ 
+ /* RFU Multiplayer config, do not mess around too much with it */
+diff --git a/libretro/libretro.c b/libretro/libretro.c
+index 5f02c09..c555c3a 100644
+--- a/libretro/libretro.c
++++ b/libretro/libretro.c
+@@ -120,6 +120,25 @@ static void info_msg(const char* text)
+       log_cb(RETRO_LOG_INFO, "[gpSP]: %s\n", text);
+ }
+ 
++#if defined(BBK9588)
++static unsigned bbk9588_run_trace_frame;
++volatile unsigned bbk9588_run_stage;
++
++void bbk9588_load_trace(const char *stage, unsigned value)
++{
++   if (log_cb)
++      log_cb(RETRO_LOG_INFO, "BBK_LOAD_%s=0x%08X", stage, value);
++}
++
++#define BBK_RUN_TRACE(stage, value) do { \
++   bbk9588_run_stage = (value); \
++   if (bbk9588_run_trace_frame < 2) \
++      bbk9588_load_trace((stage), bbk9588_run_trace_frame + 1); \
++} while (0)
++#else
++#define BBK_RUN_TRACE(stage, value) ((void)0)
++#endif
++
+ static void show_warning_message(const char* text, unsigned durationms) {
+   unsigned ifversion = 0;
+   if (!environ_cb(RETRO_ENVIRONMENT_GET_MESSAGE_INTERFACE_VERSION, &ifversion) || ifversion >= 1) {
+@@ -575,6 +594,10 @@ void retro_get_system_av_info(struct retro_system_av_info* info)
+ void retro_init(void)
+ {
+    u32 audio_sample_buffer_size;
++#if defined(BBK9588)
++   bbk9588_run_trace_frame = 0;
++   bbk9588_run_stage = 0;
++#endif
+    audio_samples_per_frame   = (float)(GBA_SOUND_FREQUENCY) / (float)(GBA_FPS);
+    audio_samples_accumulator = 0.0f;
+    audio_sample_buffer_size  = ((u32)audio_samples_per_frame + 1) * 2;
+@@ -647,6 +667,7 @@ void retro_init(void)
+ 
+    init_gamepak_buffer();
+    init_sound();
++   init_video_buffers();
+ 
+    if(!gba_screen_pixels)
+ #ifdef _3DS
+@@ -693,8 +714,11 @@ void retro_deinit(void)
+ {
+    perf_cb.perf_log();
+    memory_term();
++   term_sound();
++   term_video_buffers();
+ 
+ #if defined(MMAP_JIT_CACHE) && defined(HAVE_DYNAREC)
++   term_dynarec_caches();
+    unmap_jit_block(rom_translation_cache, ROM_TRANSLATION_CACHE_SIZE + RAM_TRANSLATION_CACHE_SIZE);
+ #endif
+ #if defined(_3DS) && defined(HAVE_DYNAREC)
+@@ -1200,7 +1224,16 @@ bool retro_load_game(const struct retro_game_info* info)
+      memcpy(bios_rom, open_gba_bios_rom, sizeof(bios_rom));
+    }
+ 
+-   memset(gamepak_backup, 0xff, sizeof(gamepak_backup));
++#if defined(BBK9588)
++   if (!gamepak_backup)
++      return false;
++   bbk9588_load_trace("BACKUP_BEGIN", GAMEPAK_BACKUP_SIZE);
++#endif
++
++   memset(gamepak_backup, 0xff, GAMEPAK_BACKUP_SIZE);
++#if defined(BBK9588)
++   bbk9588_load_trace("BACKUP_READY", GAMEPAK_BACKUP_SIZE);
++#endif
+    if (load_gamepak(info, info->path, rtc_mode, rumble_mode, serial_setting) != 0)
+    {
+       error_msg("Could not load the game file.");
+@@ -1294,8 +1327,10 @@ void retro_run(void)
+ {
+    bool updated = false;
+ 
++   BBK_RUN_TRACE("RUN_ENTER", 1);
+    input_poll_cb();
+    update_input();
++   BBK_RUN_TRACE("RUN_INPUT_DONE", 2);
+ 
+    rumble_frame_reset();
+ 
+@@ -1370,6 +1405,7 @@ void retro_run(void)
+    }
+ 
+    /* This runs just a frame */
++   BBK_RUN_TRACE("RUN_EXEC_BEGIN", 3);
+    #ifdef HAVE_DYNAREC
+    if (dynarec_enable)
+       execute_arm_translate(execute_cycles);
+@@ -1380,6 +1416,7 @@ void retro_run(void)
+       clear_gamepak_stickybits();
+       execute_arm(execute_cycles);
+    }
++   BBK_RUN_TRACE("RUN_EXEC_END", 4);
+ 
+    if (rumble_cb) {
+      // TODO: Add some user-option to select a rumble policy
+@@ -1388,8 +1425,12 @@ void retro_run(void)
+      rumble_cb(0, RETRO_RUMBLE_STRONG, MIN(strength, 0xffff) / 2);
+    }
+ 
++   BBK_RUN_TRACE("RUN_AUDIO_BEGIN", 5);
+    audio_run();
++   BBK_RUN_TRACE("RUN_AUDIO_END", 6);
++   BBK_RUN_TRACE("RUN_VIDEO_BEGIN", 7);
+    video_run();
++   BBK_RUN_TRACE("RUN_VIDEO_END", 8);
+ 
+    switch (serial_mode) {
+    case SERIAL_MODE_RFU:
+@@ -1402,6 +1446,11 @@ void retro_run(void)
+ 
+    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
+       check_variables(false);
++
++#if defined(BBK9588)
++   bbk9588_run_stage = 9;
++   bbk9588_run_trace_frame++;
++#endif
+ }
+ 
+ unsigned retro_api_version(void)
+diff --git a/mips/mips_emit.h b/mips/mips_emit.h
+index 79d5183..e374916 100644
+--- a/mips/mips_emit.h
++++ b/mips/mips_emit.h
+@@ -411,22 +411,26 @@ u32 arm_to_mips_reg[] =
+   _rm = arm_reg                                                               \
+ 
+ #define generate_shift_reg_lsl_no_flags(_rm, _rs)                             \
++  check_load_reg_pc(arm_reg_a2, _rm, 12);                                    \
+   mips_emit_sltiu(reg_temp, arm_to_mips_reg[_rs], 32);                        \
+   mips_emit_sllv(reg_a0, arm_to_mips_reg[_rm], arm_to_mips_reg[_rs]);         \
+   mips_emit_movz(reg_a0, reg_zero, reg_temp)                                  \
+ 
+ #define generate_shift_reg_lsr_no_flags(_rm, _rs)                             \
++  check_load_reg_pc(arm_reg_a2, _rm, 12);                                    \
+   mips_emit_sltiu(reg_temp, arm_to_mips_reg[_rs], 32);                        \
+   mips_emit_srlv(reg_a0, arm_to_mips_reg[_rm], arm_to_mips_reg[_rs]);         \
+   mips_emit_movz(reg_a0, reg_zero, reg_temp)                                  \
+ 
+ #define generate_shift_reg_asr_no_flags(_rm, _rs)                             \
++  check_load_reg_pc(arm_reg_a2, _rm, 12);                                    \
+   mips_emit_sltiu(reg_temp, arm_to_mips_reg[_rs], 32);                        \
+   mips_emit_b(bne, reg_temp, reg_zero, 2);                                    \
+   mips_emit_srav(reg_a0, arm_to_mips_reg[_rm], arm_to_mips_reg[_rs]);         \
+   mips_emit_sra(reg_a0, reg_a0, 31)                                           \
+ 
+ #define generate_shift_reg_ror_no_flags(_rm, _rs)                             \
++  check_load_reg_pc(arm_reg_a2, _rm, 12);                                    \
+   rotate_right_var(reg_a0, arm_to_mips_reg[_rm],                              \
+                    reg_temp, arm_to_mips_reg[_rs])                            \
+ 
+@@ -495,7 +499,9 @@ u32 arm_to_mips_reg[] =
+ 
+ #define generate_shift_reg(arm_reg, name, flags_op)                           \
+   u32 rs = ((opcode >> 8) & 0x0F);                                            \
+-  generate_shift_reg_##name##_##flags_op(rm, rs);                             \
++  generate_load_reg_pc(reg_a1, rs, 8);                                        \
++  mips_emit_andi(reg_a1, reg_a1, 0xFF);                                       \
++  generate_shift_reg_##name##_##flags_op(rm, arm_reg_a1);                     \
+   rm = arm_reg                                                                \
+ 
+ // Made functions due to the macro expansion getting too large.
+@@ -1050,10 +1056,10 @@ u32 execute_spsr_restore_body(u32 address)
+ 
+ #define arm_generate_op_load_no()                                             \
+ 
+-#define arm_op_check_yes()                                                    \
+-  check_load_reg_pc(arm_reg_a1, rn, 8)                                        \
++#define arm_op_check_yes(pc_offset)                                           \
++  check_load_reg_pc(arm_reg_a1, rn, pc_offset)                                \
+ 
+-#define arm_op_check_no()                                                     \
++#define arm_op_check_no(pc_offset)                                            \
+ 
+ #define arm_generate_op_reg_flags(name, load_op)                              \
+   arm_decode_data_proc_reg(opcode);                                           \
+@@ -1066,21 +1072,21 @@ u32 execute_spsr_restore_body(u32 address)
+     generate_load_rm_sh(rm, no_flags);                                        \
+   }                                                                           \
+                                                                               \
+-  arm_op_check_##load_op();                                                   \
++  arm_op_check_##load_op((opcode & 0x10) ? 12 : 8);                           \
+   generate_op_##name##_reg(arm_to_mips_reg[rd], arm_to_mips_reg[rn],          \
+    arm_to_mips_reg[rm])                                                       \
+ 
+ #define arm_generate_op_reg(name, load_op)                                    \
+   arm_decode_data_proc_reg(opcode);                                           \
+   generate_load_rm_sh(rm, no_flags);                                          \
+-  arm_op_check_##load_op();                                                   \
++  arm_op_check_##load_op((opcode & 0x10) ? 12 : 8);                           \
+   generate_op_##name##_reg(arm_to_mips_reg[rd], arm_to_mips_reg[rn],          \
+    arm_to_mips_reg[rm])                                                       \
+ 
+ #define arm_generate_op_imm(name, load_op)                                    \
+   arm_decode_data_proc_imm(opcode);                                           \
+   ror(imm, imm, imm_ror);                                                     \
+-  arm_op_check_##load_op();                                                   \
++  arm_op_check_##load_op(8);                                                  \
+   generate_op_##name##_imm(arm_to_mips_reg[rd], arm_to_mips_reg[rn])          \
+ 
+ #define arm_generate_op_imm_flags(name, load_op)                              \
+@@ -1090,7 +1096,7 @@ u32 execute_spsr_restore_body(u32 address)
+   {  /* Generate carry flag from integer rotation */                          \
+      mips_emit_addiu(reg_c_cache, reg_zero, ((imm) >> 31));                   \
+   }                                                                           \
+-  arm_op_check_##load_op();                                                   \
++  arm_op_check_##load_op(8);                                                  \
+   generate_op_##name##_imm(arm_to_mips_reg[rd], arm_to_mips_reg[rn])          \
+ 
+ #define arm_data_proc(name, type, flags_op)                                   \
+@@ -1180,6 +1186,7 @@ u32 execute_store_cpsr_body(u32 _cpsr, u32 address)
+   generate_load_reg(reg_a0, rm)                                               \
+ 
+ #define arm_psr_load_new_imm()                                                \
++  ror(imm, imm, imm_ror);                                                     \
+   generate_load_imm(reg_a0, imm)                                              \
+ 
+ #define arm_psr_store_spsr()                                                  \
+@@ -2653,9 +2660,14 @@ static void emit_phand(
+   mips_emit_addu(reg_temp, reg_temp, reg_base); // Add to the base_reg the table offset
+   mips_emit_lw(reg_rv,   reg_temp, tbloff);     // Get func addr from 1st table
+   mips_emit_lw(reg_temp, reg_temp, tbloff2);    // Get opcode from 2nd table
++  #if !defined(BBK9588)
+   mips_emit_sw(reg_temp, mips_reg_ra, -8);      // Patch instruction!
++  #endif
+ 
+-  #if defined(PSP)
++  #if defined(BBK9588)
++    mips_emit_jr(reg_rv);
++    mips_emit_nop();
++  #elif defined(PSP)
+     mips_emit_cache(0x1A, mips_reg_ra, -8);
+     mips_emit_jr(reg_rv);                       // Jump directly to target for speed
+     mips_emit_cache(0x08, mips_reg_ra, -8);
+diff --git a/mips/mips_stub.S b/mips/mips_stub.S
+index 34b0446..90778a3 100644
+--- a/mips/mips_stub.S
++++ b/mips/mips_stub.S
+@@ -25,7 +25,11 @@
+   #define REG_L ld
+   #define REG_S sd
+ #else
+-  .set mips32r2
++  #if defined(BBK9588)
++    .set mips32
++  #else
++    .set mips32r2
++  #endif
+   #define SZREG 4
+   #define REG_L lw
+   #define REG_S sw
+@@ -130,6 +134,34 @@ symbol:
+ .set noat
+ .set noreorder
+ 
++#if defined(BBK9588)
++  # JZ4740 is MIPS32 Release 1. Do not use the Release 2 di/ehb
++  # instructions here: QEMU's 24Kf accepts them, but real hardware does not.
++  .macro bbk_restore_host_irqs
++    REG_L $28, GP_SAVE($16)       # Restore the application GP before IRQs fire
++    REG_L $8, 14*SZREG($sp)
++    mtc0 $8, $12
++    nop
++    nop
++    nop
++    nop
++  .endm
++
++  .macro bbk_disable_host_irqs
++    # k0/k1 may be destroyed by an IRQ before Status.IE is cleared. Use
++    # ordinary caller-saved registers, which the firmware exception frame
++    # preserves, so a preemption cannot corrupt the Status value we write.
++    mfc0 $8, $12
++    addiu $9, $0, -2
++    and $8, $8, $9
++    mtc0 $8, $12
++    nop
++    nop
++    nop
++    nop
++  .endm
++#endif
++
+ # make sure $16 has the register base for these macros
+ 
+ #ifdef MIPS_HAS_R2_INSTS
+@@ -245,9 +277,16 @@ defsymbl(mips_update_gba)
+   sw $ra, REG_SAVE2($16)          # save return addr
+   collapse_flags                  # update cpsr
+   save_registers                  # save registers
++#if defined(BBK9588)
++  bbk_restore_host_irqs            # Service firmware IRQs with the application GP
++#endif
+   move $4, reg_cycles             # Remaining cycles as asg0
+   cfncall update_gba, 0           # process the next event
+ 
++#if defined(BBK9588)
++  bbk_disable_host_irqs            # Protect the guest register mapping again
++#endif
++
+   bltz $2, return_to_main         # Exit if a frame is complete (bit 31 is set)
+ 
+   and reg_cycles, $2, 0x7FFF      # update new cycle count (ret value)
+@@ -287,8 +326,20 @@ return_to_main:
+   REG_L $s7, 11*SZREG($sp)
+   REG_L $fp, 12*SZREG($sp)
+   REG_L $ra, 13*SZREG($sp)
++#if defined(BBK9588)
++  REG_L $8, 14*SZREG($sp)         # Stage Status after restoring host context
++  addiu $sp, $sp, 112             # Restore the caller's stack before IRQs
++  mtc0 $8, $12                    # Re-enable IRQs only at the frame boundary
++  nop
++  nop
++  nop
++  nop
++  jr $ra                          # Return with the complete host context
++  nop
++#else
+   jr $ra                          # Return to main
+   addiu $sp, $sp, 112             # Restore stack pointer (delay slot)
++#endif
+ 
+ # Perform an indirect branch.
+ 
+@@ -344,8 +395,15 @@ cpu_sleep_loop:
+   move $4, reg_cycles             # Remaining cycles as asg0
++#if defined(BBK9588)
++  bbk_restore_host_irqs            # Service firmware IRQs while the GBA CPU sleeps
++#endif
+   cfncall update_gba, 0           # process the next event
+ 
++#if defined(BBK9588)
++  bbk_disable_host_irqs            # Re-enter the protected DRC context
++#endif
++
+   bltz $2, return_to_main         # Exit if a frame is complete (bit 31 is set)
+ 
+   # since no frame was completed, this means CPU is active again.
+   # Fall through to lookup_pc to resume execution
+   and reg_cycles, $2, 0x7FFF      # update new cycle count (ret value)
+@@ -522,6 +580,17 @@ defsymbl(execute_arm_translate_internal)
+   REG_S $s7, 11*SZREG($sp)
+   REG_S $fp, 12*SZREG($sp)
+   REG_S $ra, 13*SZREG($sp)
++#if defined(BBK9588)
++  mfc0 $8, $12
++  REG_S $8, 14*SZREG($sp)         # Preserve the caller's CP0 Status
++  addiu $9, $0, -2
++  and $9, $8, $9
++  mtc0 $9, $12
++  nop
++  nop
++  nop
++  nop
++#endif
+ 
+   move $16, $5
+   REG_S $28, GP_SAVE($16)
+@@ -633,4 +702,3 @@ defsymbl(ram_translation_cache)
+ #if defined(__linux__) && defined(__ELF__)
+   .section .note.GNU-stack,"",%progbits
+ #endif
+-
+diff --git a/sound.c b/sound.c
+index a7487b0..3a6632f 100644
+--- a/sound.c
++++ b/sound.c
+@@ -26,7 +26,11 @@ gbc_sound_struct gbc_sound_channel[4];
+ const u32 sound_frequency = GBA_SOUND_FREQUENCY;
+ 
+ u32 sound_on;
++#if defined(BBK9588)
++static s16 *sound_buffer;
++#else
+ static s16 sound_buffer[BUFFER_SIZE];
++#endif
+ static u32 sound_buffer_base;
+ 
+ static fixed16_16 gbc_sound_tick_step;
+@@ -552,7 +556,10 @@ void reset_sound(void)
+ 
+   sound_on = 0;
+   sound_buffer_base = 0;
+-  memset(sound_buffer, 0, sizeof(sound_buffer));
++#if defined(BBK9588)
++  if (!sound_buffer) return;
++#endif
++  memset(sound_buffer, 0, BUFFER_SIZE * sizeof(*sound_buffer));
+ 
+   for(i = 0; i < 2; i++, ds++)
+   {
+@@ -585,6 +592,10 @@ void reset_sound(void)
+ 
+ void init_sound()
+ {
++#if defined(BBK9588)
++  if (!sound_buffer) sound_buffer = (s16*)malloc(BUFFER_SIZE * sizeof(*sound_buffer));
++#endif
++
+   /* 256 / sound_frequency in 16.16 == 256 (sound_frequency == 2^16). */
+   gbc_sound_tick_step = (fixed16_16)256u;
+ 
+@@ -594,6 +605,17 @@ void init_sound()
+   reset_sound();
+ }
+ 
++void term_sound()
++{
++#if defined(BBK9588)
++  if (sound_buffer)
++  {
++    free(sound_buffer);
++    sound_buffer = NULL;
++  }
++#endif
++}
++
+ 
+ bool sound_check_savestate(const u8 *src)
+ {
+@@ -669,7 +691,7 @@ bool sound_read_savestate(const u8 *src)
+    * time decodes as silence after load instead of random pre-load mix.
+    * This makes audio output deterministic across save/load at the cost of
+    * up to one frame of silence at the load point. */
+-  memset(sound_buffer, 0, sizeof(sound_buffer));
++  memset(sound_buffer, 0, BUFFER_SIZE * sizeof(*sound_buffer));
+ 
+   if (!(
+     bson_read_int32(snddoc, "on", &sound_on) &&
+diff --git a/sound.h b/sound.h
+index 7837f35..62679f6 100644
+--- a/sound.h
++++ b/sound.h
+@@ -107,6 +107,7 @@ unsigned sound_timer(fixed8_24 frequency_step, u32 channel);
+ void sound_reset_fifo(u32 channel);
+ void render_gbc_sound();
+ void init_sound();
++void term_sound();
+ 
+ bool sound_check_savestate(const u8 *src);
+ unsigned sound_write_savestate(u8 *dst);
+diff --git a/video.cc b/video.cc
+index 9d9f4bd..cddf754 100644
+--- a/video.cc
++++ b/video.cc
+@@ -996,10 +996,36 @@ static const u8 obj_dim_table[3][4][2] = {
+   { {8, 16}, {8, 32}, {16, 32}, {32, 64} }
+ };
+ 
++#if defined(BBK9588)
++static u8 (*obj_priority_list)[160][128];
++#else
+ static u8 obj_priority_list[5][160][128];
++#endif
+ static u8 obj_priority_count[5][160];
+ static u8 obj_alpha_count[160];
+ 
++int init_video_buffers(void)
++{
++#if defined(BBK9588)
++  if (!obj_priority_list)
++    obj_priority_list = (u8 (*)[160][128])malloc(5 * 160 * 128);
++  return obj_priority_list != NULL;
++#else
++  return 1;
++#endif
++}
++
++void term_video_buffers(void)
++{
++#if defined(BBK9588)
++  if (obj_priority_list)
++  {
++    free(obj_priority_list);
++    obj_priority_list = NULL;
++  }
++#endif
++}
++
+ typedef struct {
+   s32 obj_x, obj_y;
+   s32 obj_w, obj_h;
+diff --git a/video.h b/video.h
+index e7ca137..b814d7c 100644
+--- a/video.h
++++ b/video.h
+@@ -20,6 +20,8 @@
+ #ifndef VIDEO_H
+ #define VIDEO_H
+ 
++int init_video_buffers(void);
++void term_video_buffers(void);
+ void update_scanline(void);
+ void video_reload_counters(void);
+ 

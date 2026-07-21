@@ -1,0 +1,37 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build GBA.bda
+        shell: pwsh
+        run: .\tools\build.ps1 -Target gpsp_app
+
+      - name: Verify public ROM fixtures
+        shell: pwsh
+        run: .\tools\verify_public_test_roms.ps1
+
+      - name: Upload BDA
+        uses: actions/upload-artifact@v4
+        with:
+          name: GBA-bda
+          path: build/gpsp_app/GBA.bda
+          if-no-files-found: error

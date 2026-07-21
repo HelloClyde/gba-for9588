@@ -1,0 +1,21 @@
+# Private, user-owned ROMs and machine-local fixture paths.
+/tests/roms/private/
+/tests/roms/fixtures.local.psd1
+
+# Reproducible upstream checkouts and the cross toolchain.
+/.deps/
+
+# Emulator output and generated test artifacts.
+/build/
+/tmp/
+/tests/output/
+*.sav
+*.srm
+*.log
+
+# Python and local development environments.
+__pycache__/
+*.py[cod]
+/.venv/
+/.vs/
+/.vscode/

@@ -1,0 +1,14 @@
+* text=auto eol=lf
+*.c text eol=lf
+*.cc text eol=lf
+*.h text eol=lf
+*.S text eol=lf
+*.py text eol=lf
+*.ps1 text eol=crlf
+*.psd1 text eol=crlf
+*.md text eol=lf
+*.patch text eol=lf -whitespace
+*.yml text eol=lf
+*.png binary
+*.bda binary
+*.gba binary
