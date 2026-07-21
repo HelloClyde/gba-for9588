@@ -507,7 +507,7 @@ index 6fb26fc..62a39cb 100644
  static u32 random_state = 0;
  
 +#if defined(BBK9588)
-+#define BBK9588_INPUT_POLL_CYCLES 8192u
++#define BBK9588_INPUT_POLL_CYCLES 16384u
 +static u32 bbk9588_input_cycle_accumulator;
 +extern void bbk9588_poll_input(void);
 +#endif

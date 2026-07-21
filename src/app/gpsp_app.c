@@ -26,9 +26,11 @@ extern volatile unsigned bbk9588_run_stage;
 #define GBA_WIDTH 240
 #define GBA_HEIGHT 160
 #define ESCAPE_HOLD_TICKS 32u
+#define ESCAPE_RELEASE_MAX_TICKS 200u
+#define CLOSE_PUMP_LIMIT 128u
 #define AUDIO_BACKPRESSURE_MAX_TICKS 4u
 #define RAW_EVENT_MAX_PER_POLL 8u
-#define BBK9588_INPUT_POLL_CYCLES 8192u
+#define BBK9588_INPUT_POLL_CYCLES 16384u
 #if defined(BBK_GPSP_CPU_TEST)
 #define DIAGNOSTIC_FRAME_INTERVAL 120u
 #else
@@ -97,6 +99,10 @@ static u32 g_raw_touch_down_count;
 static u32 g_raw_touch_move_count;
 static u32 g_raw_touch_up_count;
 static u32 g_raw_event_ignored;
+static u32 g_touch_position_reads;
+static u32 g_touch_hit_changes;
+static u32 g_exit_release_ticks;
+static u32 g_close_pump_calls;
 static volatile u32 g_diag_loop_stage;
 static volatile u32 g_diag_loop_frame;
 
@@ -401,18 +407,33 @@ static size_t audio_callback(const int16_t *data, size_t frames)
     return pushed;
 }
 
+static u32 touch_visual_mask(void)
+{
+    return g_touch_mask |
+        (g_sound_touch_down ? GBA_CONTROL_SOUND : 0u) |
+        (g_help_touch_down ? GBA_CONTROL_HELP : 0u) |
+        (g_rom_touch_down ? GBA_CONTROL_ROM : 0u);
+}
+
 static void clear_touch_state(void)
 {
+    u32 previous_visual_mask = touch_visual_mask();
+
     g_raw_touch_down = 0;
     g_touch_mask = 0u;
     g_sound_touch_down = 0;
     g_help_touch_down = 0;
     g_rom_touch_down = 0;
-    g_controls_dirty = 1;
+    if (previous_visual_mask != 0u) {
+        ++g_touch_hit_changes;
+        g_controls_dirty = 1;
+    }
 }
 
 static void apply_touch_hit(u32 hit)
 {
+    u32 previous_visual_mask = touch_visual_mask();
+
     if ((hit & GBA_CONTROL_SOUND) != 0u) {
         g_help_touch_down = 0;
         g_rom_touch_down = 0;
@@ -443,11 +464,15 @@ static void apply_touch_hit(u32 hit)
         g_rom_touch_down = 0;
         g_touch_mask = hit;
     }
-    g_controls_dirty = 1;
+    if (touch_visual_mask() != previous_visual_mask) {
+        ++g_touch_hit_changes;
+        g_controls_dirty = 1;
+    }
 }
 
 static void update_touch_position(void)
 {
+    ++g_touch_position_reads;
     bda_gui_touch_position(&g_touch_x, &g_touch_y);
     apply_touch_hit(gba_controls_hit_test((s32)g_touch_x, (s32)g_touch_y));
 }
@@ -456,6 +481,7 @@ static void poll_raw_touch_events(void)
 {
     bda_gui_raw_event_t event;
     u32 batch_count = 0u;
+    int move_pending = 0;
 
     ++g_raw_poll_calls;
     while (batch_count < RAW_EVENT_MAX_PER_POLL) {
@@ -469,11 +495,12 @@ static void poll_raw_touch_events(void)
                 ++g_raw_touch_down_count;
                 g_raw_touch_down = 1;
                 update_touch_position();
+                move_pending = 0;
                 break;
             case BDA_INPUT_EVENT_TOUCH_MOVE:
                 ++g_raw_touch_move_count;
                 if (g_raw_touch_down) {
-                    update_touch_position();
+                    move_pending = 1;
                 } else {
                     ++g_raw_event_ignored;
                 }
@@ -482,6 +509,7 @@ static void poll_raw_touch_events(void)
                 ++g_raw_touch_up_count;
                 if (g_raw_touch_down) {
                     clear_touch_state();
+                    move_pending = 0;
                 } else {
                     ++g_raw_event_ignored;
                 }
@@ -490,6 +518,9 @@ static void poll_raw_touch_events(void)
                 ++g_raw_event_ignored;
                 break;
         }
+    }
+    if (move_pending && g_raw_touch_down) {
+        update_touch_position();
     }
     if (batch_count > g_raw_event_max_batch) {
         g_raw_event_max_batch = batch_count;
@@ -861,9 +892,9 @@ static int initialize_window(bda_frame_desc_t *descriptor)
     g_controls_picture.height = GBA_CONTROLS_HEIGHT;
     g_controls_picture.selected_index = -1;
 #if defined(BBK_GPSP_CPU_TEST)
-    descriptor->title = "GBA RAW INPUT TEST";
+    descriptor->title = "GBA RAW INPUT TEST R34";
 #else
-    descriptor->title = "GBA RAW INPUT R32";
+    descriptor->title = "GBA RAW INPUT R34";
 #endif
     descriptor->wndproc = app_window_proc;
     descriptor->height = SCREEN_WIDTH;
@@ -927,7 +958,7 @@ static void apply_audio_toggle(void)
 
 static void log_runtime_progress(void)
 {
-    char line[384];
+    char line[448];
     u32 now = bda_gui_tick_count_25ms();
     u32 elapsed_ticks = bda_gui_tick_elapsed_25ms(g_progress_last_tick, now);
     u32 core_delta = g_core_frames - g_progress_last_core_frames;
@@ -942,7 +973,7 @@ static void log_runtime_progress(void)
 
     if (snprintf(
             line, sizeof(line),
-            "RUN core=%u emu_fps100=%u video_fps100=%u video_cb=%u video_ok=%u video_err=%u sound=%u audio=%u short=%u drop=%u queue=%u aud_hz=%u bp=%u raw_poll=%u raw_evt=%u raw_max=%u raw_cap=%u raw_ignored=%u touch_down=%u touch_move=%u touch_up=%u",
+            "RUN core=%u emu_fps100=%u video_fps100=%u video_cb=%u video_ok=%u video_err=%u sound=%u audio=%u short=%u drop=%u queue=%u aud_hz=%u bp=%u raw_poll=%u raw_evt=%u raw_max=%u raw_cap=%u raw_ignored=%u touch_down=%u touch_move=%u touch_up=%u touch_pos=%u hit_change=%u ctrl_draw=%u",
             g_core_frames, emu_fps100, video_fps100,
             g_video_callbacks, g_video_frames,
             g_video_submit_errors, (u32)g_audio_enabled, g_audio.blocks_written,
@@ -951,7 +982,8 @@ static void log_runtime_progress(void)
             g_raw_poll_calls, g_raw_event_count, g_raw_event_max_batch,
             g_raw_event_cap_hits, g_raw_event_ignored,
             g_raw_touch_down_count, g_raw_touch_move_count,
-            g_raw_touch_up_count
+            g_raw_touch_up_count, g_touch_position_reads,
+            g_touch_hit_changes, g_controls_render_attempts
         ) > 0) {
         log_text(line);
     }
@@ -961,18 +993,72 @@ static void log_runtime_progress(void)
     g_progress_last_audio_samples = audio_samples;
 }
 
-static void close_window(void)
+static int wait_escape_release(void)
 {
+    bda_gui_input_packet_t packet;
+    u32 start = bda_gui_tick_count_25ms();
+
+    log_text("EXIT_ESCAPE_RELEASE_BEGIN");
+    for (;;) {
+        u32 now;
+
+        (void)bda_gui_input_packet(&packet);
+        if (!bda_gui_input_packet_key_pressed(&packet, BDA_KEY_ESCAPE)) {
+            g_exit_release_ticks = bda_gui_tick_elapsed_25ms(
+                start, bda_gui_tick_count_25ms()
+            );
+            log_value("EXIT_ESCAPE_RELEASE_TICKS=", g_exit_release_ticks);
+            log_text("EXIT_ESCAPE_RELEASE=PASS");
+            return 1;
+        }
+        now = bda_gui_tick_count_25ms();
+        if (bda_gui_tick_elapsed_25ms(start, now) >=
+            ESCAPE_RELEASE_MAX_TICKS) {
+            g_exit_release_ticks = bda_gui_tick_elapsed_25ms(start, now);
+            log_value("EXIT_ESCAPE_RELEASE_TICKS=", g_exit_release_ticks);
+            log_text("EXIT_ESCAPE_RELEASE=TIMEOUT");
+            return 0;
+        }
+        bda_sys_delay(1u);
+    }
+}
+
+static void close_window(bda_gui_message_t *message)
+{
+    int pump_result = 1;
+    int stop_result;
+    int release_result;
+
     if (!g_frame) {
         free(g_controls_pixels);
         g_controls_pixels = 0;
         return;
     }
     g_touch_mask = 0u;
-    (void)bda_gui_frame_stop(g_frame);
-    (void)bda_gui_frame_release(g_frame);
+    log_text("WINDOW_STOP_BEGIN");
+    stop_result = bda_gui_frame_stop(g_frame);
+    log_value("WINDOW_STOP_RESULT=", (u32)stop_result);
+    release_result = bda_gui_frame_release(g_frame);
+    log_value("WINDOW_RELEASE_RESULT=", (u32)release_result);
+
+    /* Raw input has stopped; the frame pump is used only to finish detach. */
+    log_text("WINDOW_CLOSE_PUMP_BEGIN");
+    while (!g_detached && g_close_pump_calls < CLOSE_PUMP_LIMIT) {
+        pump_result = bda_gui_event_pump_frame_once(message, g_frame);
+        ++g_close_pump_calls;
+        if (!pump_result) {
+            break;
+        }
+        bda_sys_delay(1u);
+    }
+    log_value("WINDOW_CLOSE_PUMP_CALLS=", g_close_pump_calls);
+    log_value("WINDOW_CLOSE_PUMP_RESULT=", (u32)pump_result);
+    log_value("WINDOW_CLOSE_DETACHED=", (u32)g_detached);
+
     release_draw_context();
+    log_text("WINDOW_DRAW_RELEASE=PASS");
     bda_gui_close_frame(g_frame);
+    log_text("WINDOW_CLOSE_RETURN=PASS");
     g_frame = 0;
     free(g_controls_pixels);
     g_controls_pixels = 0;
@@ -991,12 +1077,14 @@ static void shutdown_core(void)
 int bda_main(void)
 {
     bda_frame_desc_t descriptor;
+    bda_gui_message_t message;
     void *save_data;
     int file;
     int select_result;
     int result = 0;
 
     g_log_path[0] = 0;
+    memset(&message, 0, sizeof(message));
     memset(&g_audio, 0, sizeof(g_audio));
     memset(&g_save_store, 0, sizeof(g_save_store));
     g_frame = 0;
@@ -1049,6 +1137,10 @@ int bda_main(void)
     g_raw_touch_move_count = 0u;
     g_raw_touch_up_count = 0u;
     g_raw_event_ignored = 0u;
+    g_touch_position_reads = 0u;
+    g_touch_hit_changes = 0u;
+    g_exit_release_ticks = 0u;
+    g_close_pump_calls = 0u;
     g_diag_loop_stage = 0u;
     g_diag_loop_frame = 0u;
 
@@ -1067,10 +1159,10 @@ int bda_main(void)
     }
 #if defined(BBK_GPSP_CPU_TEST)
     log_text("BBK9588 GBA RAW INPUT TEST");
-    log_text("BUILD_ID=DRC_R1_RAW_INPUT_8K_TEST_R32");
+    log_text("BUILD_ID=DRC_R1_RAW_INPUT_EXIT_HANDOFF_TEST_R34");
 #else
-    log_text("BBK9588 GBA RAW INPUT R32");
-    log_text("BUILD_ID=DRC_R1_30FPS_RAW_INPUT_8K_AUDIO_R32");
+    log_text("BBK9588 GBA RAW INPUT R34");
+    log_text("BUILD_ID=DRC_R1_30FPS_RAW_INPUT_EXIT_HANDOFF_R34");
     log_text("HOST_IRQ_WINDOW=UPDATE_GBA_GP_SAFE");
     log_text("DRC_IRQ_POLICY=OPEN_DURING_CORE_C_CALLBACKS");
     log_text("IRQ_ENABLE_ORDER=RESTORE_APP_GP_THEN_STATUS");
@@ -1081,8 +1173,11 @@ int bda_main(void)
     log_text("INPUT_ARCH=RAW_EVENT_SELF_MANAGED");
     log_value("INPUT_POLL_CYCLES=", BBK9588_INPUT_POLL_CYCLES);
     log_value("RAW_EVENT_MAX_PER_POLL=", RAW_EVENT_MAX_PER_POLL);
+    log_text("RAW_MOVE_POLICY=COALESCE_PER_POLL");
+    log_text("CONTROL_REDRAW=STATE_CHANGE_ONLY");
     log_text("PHYSICAL_KEYS=INPUT_PACKET_ONCE_PER_POLL");
     log_text("WINDOW_EVENT_PUMP=DISABLED");
+    log_text("EXIT_EVENT_PUMP=DETACH_ONLY_AFTER_RAW_STOP");
     log_text("WINDOW_TIMER=DISABLED");
     log_text("AUDIO_WAIT_EVENT_PUMP=OFF_PCM_PRIORITY");
     log_text("TOUCH_LEVEL=RAW_EVENTS_8_12_11");
@@ -1128,7 +1223,7 @@ int bda_main(void)
     log_text("WINDOW_BEGIN");
     if (!initialize_window(&descriptor)) {
         log_text("WINDOW=ERROR");
-        close_window();
+        close_window(&message);
         shutdown_core();
         return 3;
     }
@@ -1202,7 +1297,10 @@ int bda_main(void)
             ++g_save_writes;
         }
     }
-    close_window();
+    if (g_exit_cause == EXIT_CAUSE_ESCAPE_HOLD) {
+        (void)wait_escape_release();
+    }
+    close_window(&message);
     shutdown_core();
     log_value("VIDEO_FRAMES=", g_video_frames);
     log_value("VIDEO_CALLBACKS=", g_video_callbacks);
@@ -1221,6 +1319,9 @@ int bda_main(void)
     log_value("RAW_TOUCH_DOWN=", g_raw_touch_down_count);
     log_value("RAW_TOUCH_MOVE=", g_raw_touch_move_count);
     log_value("RAW_TOUCH_UP=", g_raw_touch_up_count);
+    log_value("TOUCH_POSITION_READS=", g_touch_position_reads);
+    log_value("TOUCH_HIT_CHANGES=", g_touch_hit_changes);
+    log_value("CONTROLS_RENDER_ATTEMPTS=", g_controls_render_attempts);
     log_value("SAVE_WRITES=", g_save_writes);
     log_text(result ? "RESULT=FAIL" : "RESULT=PASS");
     return result;
