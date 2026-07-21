@@ -1,10 +1,20 @@
 # GBA for BBK 9588
 
+[![Build](https://github.com/HelloClyde/gba-for9588/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/HelloClyde/gba-for9588/actions/workflows/build.yml)
+[![Latest Release](https://img.shields.io/github/v/release/HelloClyde/gba-for9588)](https://github.com/HelloClyde/gba-for9588/releases/latest)
+[![License: GPL v2](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
+
 基于 [libretro/gpSP](https://github.com/libretro/gpsp) 的 BBK 9588 原生 GBA 模拟器。
 项目使用 MIPS 动态重编译器，通过 [BBK 9588 BDA SDK](sdk/) 构建为独立 `GBA.bda`。
 
 > 当前仍是测试版本。模拟器和真机均已完成 ROM 加载、画面、声音、触摸控制、换 ROM 与
 > 存档恢复验证；触摸延迟和长时间真机稳定性仍在继续测试。
+
+## 下载
+
+从 [GitHub Releases](https://github.com/HelloClyde/gba-for9588/releases/latest) 下载最新版本，
+或直接下载 [GBA.bda](https://github.com/HelloClyde/gba-for9588/releases/latest/download/GBA.bda)。
+发布页同时提供 `GBA.bda.sha256` 校验文件。
 
 ## 功能
 

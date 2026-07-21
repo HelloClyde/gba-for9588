@@ -2,8 +2,15 @@ name: Build
 
 on:
   push:
+    branches:
+      - main
+    tags:
+      - "v*"
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   windows:
@@ -12,12 +19,12 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: true
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -29,9 +36,32 @@ jobs:
         shell: pwsh
         run: .\tools\verify_public_test_roms.ps1
 
+      - name: Create checksum
+        shell: pwsh
+        run: |
+          $path = "build/gpsp_app/GBA.bda"
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
+          "$hash  GBA.bda" | Set-Content -Encoding ascii "$path.sha256"
+
       - name: Upload BDA
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: GBA-bda
-          path: build/gpsp_app/GBA.bda
+          path: |
+            build/gpsp_app/GBA.bda
+            build/gpsp_app/GBA.bda.sha256
           if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" `
+            "build/gpsp_app/GBA.bda" `
+            "build/gpsp_app/GBA.bda.sha256" `
+            --repo "${{ github.repository }}" `
+            --verify-tag `
+            --generate-notes `
+            --title "GBA for BBK 9588 ${{ github.ref_name }}"
