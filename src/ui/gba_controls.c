@@ -5,6 +5,14 @@
 #define RGB565(r, g, b) \
     ((u16)((((u32)(r) & 0xf8u) << 8) | (((u32)(g) & 0xfcu) << 3) | ((u32)(b) >> 3)))
 
+#define TOOL_BUTTON_TOP 5
+#define TOOL_BUTTON_BOTTOM 28
+#define TOOL_BUTTON_WIDTH 34
+#define SOUND_BUTTON_LEFT 103
+#define ROM_BUTTON_LEFT 143
+#define TOOL_ICON_TOP 8
+#define TOOL_ICON_SIZE 18
+
 static void fill_rect(u16 *pixels, int left, int top, int right, int bottom, u16 color)
 {
     int x;
@@ -39,33 +47,59 @@ static void fill_circle(u16 *pixels, int center_x, int center_y, int radius, u16
     }
 }
 
-static void draw_speaker_icon(u16 *pixels, int sound_enabled, u16 color)
+static void fill_rounded_rect(
+    u16 *pixels, int left, int top, int right, int bottom, u16 color
+)
 {
-    int row;
-    fill_rect(pixels, 108, 12, 113, 21, color);
-    for (row = 0; row < 13; ++row) {
-        int half_width = row < 7 ? row / 2 : (12 - row) / 2;
+    fill_rect(pixels, left + 2, top, right - 2, bottom, color);
+    fill_rect(pixels, left + 1, top + 1, right - 1, bottom - 1, color);
+    fill_rect(pixels, left, top + 2, right, bottom - 2, color);
+}
+
+static void draw_speaker_icon(
+    u16 *pixels, int left, int top, int sound_enabled, u16 color
+)
+{
+    int index;
+
+    fill_rect(pixels, left + 1, top + 6, left + 5, top + 12, color);
+    for (index = 0; index < 12; ++index) {
+        int distance = index < 6 ? 5 - index : index - 6;
+        int cone_left = left + 5 + distance * 4 / 6;
         fill_rect(
-            pixels, 113, 10 + row, 114 + half_width, 11 + row, color
+            pixels, cone_left, top + 2 + index,
+            left + 10, top + 3 + index, color
         );
     }
+
     if (sound_enabled) {
-        fill_rect(pixels, 122, 12, 124, 21, color);
-        fill_rect(pixels, 127, 9, 129, 24, color);
+        fill_rect(pixels, left + 12, top + 5, left + 14, top + 7, color);
+        fill_rect(pixels, left + 13, top + 7, left + 15, top + 11, color);
+        fill_rect(pixels, left + 12, top + 11, left + 14, top + 13, color);
+        fill_rect(pixels, left + 15, top + 3, left + 17, top + 5, color);
+        fill_rect(pixels, left + 16, top + 5, left + 18, top + 13, color);
+        fill_rect(pixels, left + 15, top + 13, left + 17, top + 15, color);
     } else {
-        for (row = 0; row < 16; ++row) {
-            fill_rect(pixels, 119 + row / 2, 8 + row, 121 + row / 2, 9 + row, color);
+        for (index = 0; index < 6; ++index) {
+            fill_rect(
+                pixels, left + 11 + index, top + 4 + index,
+                left + 13 + index, top + 6 + index, color
+            );
+            fill_rect(
+                pixels, left + 16 - index, top + 4 + index,
+                left + 18 - index, top + 6 + index, color
+            );
         }
     }
 }
 
-static void draw_folder_icon(u16 *pixels, u16 color)
+static void draw_folder_icon(u16 *pixels, int left, int top, u16 color)
 {
-    fill_rect(pixels, 149, 10, 157, 13, color);
-    fill_rect(pixels, 147, 13, 172, 15, color);
-    fill_rect(pixels, 147, 13, 150, 23, color);
-    fill_rect(pixels, 169, 13, 172, 23, color);
-    fill_rect(pixels, 147, 21, 172, 24, color);
+    fill_rect(pixels, left + 2, top + 3, left + 8, top + 5, color);
+    fill_rect(pixels, left + 1, top + 5, left + 16, top + 7, color);
+    fill_rect(pixels, left + 1, top + 6, left + 3, top + 14, color);
+    fill_rect(pixels, left + 15, top + 6, left + 17, top + 14, color);
+    fill_rect(pixels, left + 1, top + 12, left + 17, top + 14, color);
 }
 
 static const u8 *glyph(char character)
@@ -146,8 +180,14 @@ u32 gba_controls_hit_test(s32 screen_x, s32 screen_y)
     }
     if (in_rect(screen_x, y, 4, 5, 59, 28)) return GBA_CONTROL_L;
     if (in_rect(screen_x, y, 64, 5, 87, 28)) return GBA_CONTROL_HELP;
-    if (in_rect(screen_x, y, 104, 5, 137, 28)) return GBA_CONTROL_SOUND;
-    if (in_rect(screen_x, y, 143, 5, 176, 28)) return GBA_CONTROL_ROM;
+    if (in_rect(
+            screen_x, y, SOUND_BUTTON_LEFT, TOOL_BUTTON_TOP,
+            SOUND_BUTTON_LEFT + TOOL_BUTTON_WIDTH, TOOL_BUTTON_BOTTOM
+        )) return GBA_CONTROL_SOUND;
+    if (in_rect(
+            screen_x, y, ROM_BUTTON_LEFT, TOOL_BUTTON_TOP,
+            ROM_BUTTON_LEFT + TOOL_BUTTON_WIDTH, TOOL_BUTTON_BOTTOM
+        )) return GBA_CONTROL_ROM;
     if (in_rect(screen_x, y, 181, 5, 236, 28)) return GBA_CONTROL_R;
     if (in_circle(screen_x, y, 204, 63, 25)) return GBA_CONTROL_A;
     if (in_circle(screen_x, y, 160, 96, 25)) return GBA_CONTROL_B;
@@ -192,16 +232,18 @@ void gba_controls_render(u16 *pixels, u32 pressed_mask, int sound_enabled)
             RGB565(53, 112, 121), RGB565(109, 193, 202)
         )
     );
-    fill_rect(
-        pixels, 104, 5, 137, 28,
+    fill_rounded_rect(
+        pixels, SOUND_BUTTON_LEFT, TOOL_BUTTON_TOP,
+        SOUND_BUTTON_LEFT + TOOL_BUTTON_WIDTH, TOOL_BUTTON_BOTTOM,
         button_color(
             pressed_mask, GBA_CONTROL_SOUND,
             sound_enabled ? RGB565(38, 132, 101) : RGB565(72, 78, 81),
             sound_enabled ? RGB565(83, 196, 151) : RGB565(130, 139, 143)
         )
     );
-    fill_rect(
-        pixels, 143, 5, 176, 28,
+    fill_rounded_rect(
+        pixels, ROM_BUTTON_LEFT, TOOL_BUTTON_TOP,
+        ROM_BUTTON_LEFT + TOOL_BUTTON_WIDTH, TOOL_BUTTON_BOTTOM,
         button_color(
             pressed_mask, GBA_CONTROL_ROM,
             RGB565(164, 88, 35), RGB565(237, 151, 78)
@@ -210,8 +252,16 @@ void gba_controls_render(u16 *pixels, u32 pressed_mask, int sound_enabled)
     draw_text(pixels, 27, 10, "L", 2, label);
     draw_text(pixels, 70, 10, "?", 2, label);
     draw_text(pixels, 204, 10, "R", 2, label);
-    draw_speaker_icon(pixels, sound_enabled, label);
-    draw_folder_icon(pixels, label);
+    draw_speaker_icon(
+        pixels,
+        SOUND_BUTTON_LEFT + (TOOL_BUTTON_WIDTH - TOOL_ICON_SIZE) / 2,
+        TOOL_ICON_TOP, sound_enabled, label
+    );
+    draw_folder_icon(
+        pixels,
+        ROM_BUTTON_LEFT + (TOOL_BUTTON_WIDTH - TOOL_ICON_SIZE) / 2,
+        TOOL_ICON_TOP, label
+    );
 
     fill_rect(pixels, 42, 48, 69, 133, panel);
     fill_rect(pixels, 14, 76, 97, 105, panel);

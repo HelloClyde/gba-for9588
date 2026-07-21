@@ -45,7 +45,10 @@
 
 - **MIPS32 动态重编译**：启用 gpSP MIPS dynarec，使用可执行 JIT 缓冲区和 32 字节粒度的
   D-cache 写回/I-cache 失效，避免逐条解释 ARM 指令；缩小 translation cache 与 ROM branch
-  hash，以适应 9588 的可用内存。
+  hash，以适应 9588 的可用内存。固件 IRQ 只在恢复完整宿主 `$gp/$s0-$s7/$fp/$ra` 后开放，
+  核心回调与运行期 ROM page I/O 都通过宿主安全包装器执行；raw 触摸和实体键采集移到完整
+  GBA 帧的宿主边界，避免 SDK 输入调用与 guest 寄存器上下文交叉；translation cache 达到
+  75% 时只在帧边界同时回收 ROM/RAM JIT，避免深层翻译期间回卷。
 - **按需读取 ROM**：不把 16 MiB/32 MiB ROM 整体装入内存。构建配置使用 2 MiB ROM cache，
   miss 时按 32 KiB 页面读取并替换，兼顾内存占用与文件 I/O 次数。
 - **逻辑帧与显示帧解耦**：固定 `frameskip=1`，核心仍执行约 59.7 帧/秒，只提交约 30 帧/秒；
@@ -54,11 +57,12 @@
 - **分块 PCM 流水线**：将 gpSP 的 65536 Hz 立体声降采样为 22050 Hz 单声道，使用 4096
   sample 环形缓冲区和 512 sample 硬件写块。PCM 服务与输入采样分离，并对背压等待设置上限，
   避免音频队列反向放大输入轮询频率。
-- **子帧自管输入**：游戏运行阶段不使用 Window Timer 或窗口消息泵。gpSP 每执行约 16384 个
-  GBA cycles（约 0.98 ms）读取最多 8 条 raw 触摸事件，并只读取一次 6-byte 实体键状态包；
+- **自管输入**：游戏运行阶段不使用 Window Timer 或窗口消息泵。每个完整 GBA 帧读取最多
+  8 条 raw 触摸事件，并只读取一次 6-byte 实体键状态包；
   同批 MOVE 只读取一次最新坐标，控制层只在命中状态变化时重绘；
-  KEYINPUT 与按键 IRQ 在 `update_gba()` 的同一宿主回调窗口内更新，不受固件 25 ms tick 限制。
-- **移出热循环的 I/O**：普通性能日志每 600 个逻辑帧记录一次；运行中不周期扫描或写入
+  输入采集与 KEYINPUT 更新在同一宿主边界完成，按键 IRQ 在重新进入 `update_gba()` 后统一提升，
+  不受固件 25 ms tick 限制。
+- **移出热循环的 I/O**：普通性能日志低频记录，诊断构建可临时提高采样频率；运行中不周期扫描或写入
   128 KiB 存档，只在换 ROM 和正常退出时 checkpoint，并通过 CRC 跳过未变化的存档写入。
 - **面向小内存的构建**：使用 `-Os`、独立函数/数据 section、链接期 `--gc-sections` 和精简
   translation cache，减少 BDA、JIT 元数据和常驻内存占用。

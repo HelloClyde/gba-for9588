@@ -20,6 +20,15 @@
 #include <string.h>
 
 extern volatile unsigned bbk9588_run_stage;
+#if defined(HAVE_DYNAREC)
+extern void bbk9588_drc_get_stats(u32 *rom_used, u32 *ram_used,
+                                  u32 *rom_flushes, u32 *ram_flushes,
+                                  u32 *proactive_flushes);
+extern volatile unsigned bbk9588_page_load_count;
+extern volatile unsigned bbk9588_page_load_last;
+extern volatile unsigned bbk9588_page_io_stage;
+extern volatile unsigned bbk9588_page_host_safe_count;
+#endif
 
 #define SCREEN_WIDTH 240
 #define SCREEN_HEIGHT 320
@@ -30,11 +39,10 @@ extern volatile unsigned bbk9588_run_stage;
 #define CLOSE_PUMP_LIMIT 128u
 #define AUDIO_BACKPRESSURE_MAX_TICKS 4u
 #define RAW_EVENT_MAX_PER_POLL 8u
-#define BBK9588_INPUT_POLL_CYCLES 16384u
 #if defined(BBK_GPSP_CPU_TEST)
 #define DIAGNOSTIC_FRAME_INTERVAL 120u
 #else
-#define DIAGNOSTIC_FRAME_INTERVAL 600u
+#define DIAGNOSTIC_FRAME_INTERVAL 120u
 #endif
 #define EXIT_CAUSE_NONE 0u
 #define EXIT_CAUSE_ESCAPE_HOLD 1u
@@ -892,9 +900,9 @@ static int initialize_window(bda_frame_desc_t *descriptor)
     g_controls_picture.height = GBA_CONTROLS_HEIGHT;
     g_controls_picture.selected_index = -1;
 #if defined(BBK_GPSP_CPU_TEST)
-    descriptor->title = "GBA RAW INPUT TEST R34";
+    descriptor->title = "GBA ROM IO TEST R39";
 #else
-    descriptor->title = "GBA RAW INPUT R34";
+    descriptor->title = "GBA ROM IO R39";
 #endif
     descriptor->wndproc = app_window_proc;
     descriptor->height = SCREEN_WIDTH;
@@ -958,7 +966,7 @@ static void apply_audio_toggle(void)
 
 static void log_runtime_progress(void)
 {
-    char line[448];
+    char line[640];
     u32 now = bda_gui_tick_count_25ms();
     u32 elapsed_ticks = bda_gui_tick_elapsed_25ms(g_progress_last_tick, now);
     u32 core_delta = g_core_frames - g_progress_last_core_frames;
@@ -970,10 +978,36 @@ static void log_runtime_progress(void)
     u32 emu_fps100 = elapsed_ticks != 0u ? core_delta * 4000u / elapsed_ticks : 0u;
     u32 video_fps100 = elapsed_ticks != 0u ? video_delta * 4000u / elapsed_ticks : 0u;
     u32 audio_hz = elapsed_ticks != 0u ? audio_delta * 40u / elapsed_ticks : 0u;
+#if defined(HAVE_DYNAREC)
+    u32 jit_rom;
+    u32 jit_ram;
+    u32 jit_rom_flushes;
+    u32 jit_ram_flushes;
+    u32 jit_proactive_flushes;
+    u32 rom_page_loads = bbk9588_page_load_count;
+    u32 rom_page_last = bbk9588_page_load_last;
+    u32 rom_page_stage = bbk9588_page_io_stage;
+    u32 rom_page_safe = bbk9588_page_host_safe_count;
+
+    bbk9588_drc_get_stats(
+        &jit_rom, &jit_ram, &jit_rom_flushes, &jit_ram_flushes,
+        &jit_proactive_flushes
+    );
+#else
+    u32 jit_rom = 0u;
+    u32 jit_ram = 0u;
+    u32 jit_rom_flushes = 0u;
+    u32 jit_ram_flushes = 0u;
+    u32 jit_proactive_flushes = 0u;
+    u32 rom_page_loads = 0u;
+    u32 rom_page_last = 0u;
+    u32 rom_page_stage = 0u;
+    u32 rom_page_safe = 0u;
+#endif
 
     if (snprintf(
             line, sizeof(line),
-            "RUN core=%u emu_fps100=%u video_fps100=%u video_cb=%u video_ok=%u video_err=%u sound=%u audio=%u short=%u drop=%u queue=%u aud_hz=%u bp=%u raw_poll=%u raw_evt=%u raw_max=%u raw_cap=%u raw_ignored=%u touch_down=%u touch_move=%u touch_up=%u touch_pos=%u hit_change=%u ctrl_draw=%u",
+            "RUN core=%u emu_fps100=%u video_fps100=%u video_cb=%u video_ok=%u video_err=%u sound=%u audio=%u short=%u drop=%u queue=%u aud_hz=%u bp=%u raw_poll=%u raw_evt=%u raw_max=%u raw_cap=%u raw_ignored=%u touch_down=%u touch_move=%u touch_up=%u touch_pos=%u hit_change=%u ctrl_draw=%u jit_rom=%u jit_ram=%u jit_rf=%u jit_wf=%u jit_pf=%u rom_pg=%u rom_last=%u rom_stage=%u rom_safe=%u",
             g_core_frames, emu_fps100, video_fps100,
             g_video_callbacks, g_video_frames,
             g_video_submit_errors, (u32)g_audio_enabled, g_audio.blocks_written,
@@ -983,7 +1017,10 @@ static void log_runtime_progress(void)
             g_raw_event_cap_hits, g_raw_event_ignored,
             g_raw_touch_down_count, g_raw_touch_move_count,
             g_raw_touch_up_count, g_touch_position_reads,
-            g_touch_hit_changes, g_controls_render_attempts
+            g_touch_hit_changes, g_controls_render_attempts,
+            jit_rom, jit_ram, jit_rom_flushes, jit_ram_flushes,
+            jit_proactive_flushes, rom_page_loads, rom_page_last,
+            rom_page_stage, rom_page_safe
         ) > 0) {
         log_text(line);
     }
@@ -1158,20 +1195,23 @@ int bda_main(void)
         (void)bda_fs_close_raw(file);
     }
 #if defined(BBK_GPSP_CPU_TEST)
-    log_text("BBK9588 GBA RAW INPUT TEST");
-    log_text("BUILD_ID=DRC_R1_RAW_INPUT_EXIT_HANDOFF_TEST_R34");
+    log_text("BBK9588 GBA ROM IO TEST R39");
+    log_text("BUILD_ID=DRC_R1_ROM_PAGE_HOST_IO_TEST_R39");
 #else
-    log_text("BBK9588 GBA RAW INPUT R34");
-    log_text("BUILD_ID=DRC_R1_30FPS_RAW_INPUT_EXIT_HANDOFF_R34");
-    log_text("HOST_IRQ_WINDOW=UPDATE_GBA_GP_SAFE");
-    log_text("DRC_IRQ_POLICY=OPEN_DURING_CORE_C_CALLBACKS");
+    log_text("BBK9588 GBA ROM IO R39");
+    log_text("BUILD_ID=DRC_R1_30FPS_ROM_PAGE_HOST_IO_R39");
+    log_text("HOST_IRQ_WINDOW=UPDATE_GBA_AND_ROM_PAGE_IO_FULL_CONTEXT");
+    log_text("HOST_IRQ_CONTEXT=GP_S0_S7_FP_RA");
+    log_text("HOST_POLL_CONTEXT=LIBRETRO_FRAME_BOUNDARY");
+    log_text("DRC_IRQ_POLICY=OPEN_DURING_CORE_CALLBACKS_AND_ROM_IO");
+    log_text("ROM_PAGE_IO=HOST_CONTEXT_EXACT_IRQ_RESTORE");
     log_text("IRQ_ENABLE_ORDER=RESTORE_APP_GP_THEN_STATUS");
     log_text("IRQ_DISABLE_REGS=T0_T1_EXCEPTION_PRESERVED");
     log_text("HELP_PAGE=SDK_PARENT0_RELEASE_REACQUIRE");
     log_text("HELP_LANGUAGE=GBK_CHINESE");
     log_text("ROM_SWITCH=CONFIRM_SAVE_RELOAD");
-    log_text("INPUT_ARCH=RAW_EVENT_SELF_MANAGED");
-    log_value("INPUT_POLL_CYCLES=", BBK9588_INPUT_POLL_CYCLES);
+    log_text("INPUT_ARCH=RAW_EVENT_FRAME_BOUNDARY");
+    log_text("INPUT_POLL_INTERVAL_FRAMES=1");
     log_value("RAW_EVENT_MAX_PER_POLL=", RAW_EVENT_MAX_PER_POLL);
     log_text("RAW_MOVE_POLICY=COALESCE_PER_POLL");
     log_text("CONTROL_REDRAW=STATE_CHANGE_ONLY");
@@ -1185,7 +1225,11 @@ int bda_main(void)
     log_text("RAW_EVENT_VALUE=IGNORED");
     log_text("STARTUP_MOVE_UP=IGNORED_UNTIL_DOWN");
     log_text("TOUCH_START_EXIT=DISABLED");
-    log_text("RUNTIME_LOG_INTERVAL_FRAMES=600");
+    log_text("RUNTIME_LOG_INTERVAL_FRAMES=120");
+    log_text("JIT_MAINTENANCE=FRAME_BOUNDARY_BOTH_CACHES");
+    log_text("JIT_PROACTIVE_THRESHOLD_PERCENT=75");
+    log_value("JIT_ROM_CAPACITY=", 2u * 1024u * 1024u);
+    log_value("JIT_RAM_CAPACITY=", 384u * 1024u);
     log_text("PERIODIC_SAVE=DISABLED_EXIT_ONLY");
     log_text("SAVE_CRC=BITWISE_STABLE");
     log_text("GPIO_AND_FIXED_TOUCH_FUNCTION=DISABLED_DRC_UNSAFE");
@@ -1322,6 +1366,12 @@ int bda_main(void)
     log_value("TOUCH_POSITION_READS=", g_touch_position_reads);
     log_value("TOUCH_HIT_CHANGES=", g_touch_hit_changes);
     log_value("CONTROLS_RENDER_ATTEMPTS=", g_controls_render_attempts);
+#if defined(HAVE_DYNAREC)
+    log_value("ROM_PAGE_LOADS=", bbk9588_page_load_count);
+    log_value("ROM_PAGE_LAST=", bbk9588_page_load_last);
+    log_value("ROM_PAGE_IO_STAGE=", bbk9588_page_io_stage);
+    log_value("ROM_PAGE_HOST_SAFE=", bbk9588_page_host_safe_count);
+#endif
     log_value("SAVE_WRITES=", g_save_writes);
     log_text(result ? "RESULT=FAIL" : "RESULT=PASS");
     return result;

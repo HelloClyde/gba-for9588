@@ -1,8 +1,8 @@
 diff --git a/cpu.h b/cpu.h
-index dd6cb89..872dee1 100644
+index dd6cb89..7abef40 100644
 --- a/cpu.h
 +++ b/cpu.h
-@@ -162,12 +162,17 @@ extern u32 idle_loop_target_pc;
+@@ -162,13 +162,24 @@ extern u32 idle_loop_target_pc;
  extern u32 translation_gate_targets;
  extern u32 translation_gate_target_pc[MAX_TRANSLATION_GATES];
  
@@ -18,25 +18,35 @@ index dd6cb89..872dee1 100644
  void init_dynarec_caches(void);
 +void term_dynarec_caches(void);
  void flush_dynarec_caches(void);
++#if defined(BBK9588)
++void bbk9588_drc_frame_maintenance(void);
++void bbk9588_drc_get_stats(u32 *rom_used, u32 *ram_used,
++                           u32 *rom_flushes, u32 *ram_flushes,
++                           u32 *proactive_flushes);
++#endif
  void init_emitter(bool);
  void init_bios_hooks(void);
+ 
 diff --git a/cpu_threaded.c b/cpu_threaded.c
-index 8942ab3..f9aa383 100644
+index 8942ab3..77b9220 100644
 --- a/cpu_threaded.c
 +++ b/cpu_threaded.c
-@@ -75,7 +75,11 @@ typedef struct
+@@ -75,7 +75,14 @@ typedef struct
    u32 next_entry;
  } hashhdr_type;
  
 +#if defined(BBK9588)
 +u32 *rom_branch_hash;
++static u32 bbk9588_rom_flushes;
++static u32 bbk9588_ram_flushes;
++static u32 bbk9588_proactive_flushes;
 +#else
  u32 rom_branch_hash[ROM_BRANCH_HASH_SIZE];
 +#endif
  
  typedef struct
  {
-@@ -224,7 +228,12 @@ typedef struct
+@@ -224,7 +231,12 @@ typedef struct
  
  /* Cache invalidation */
  
@@ -50,7 +60,23 @@ index 8942ab3..f9aa383 100644
    void platform_cache_sync(void *baseaddr, void *endptr) {
      sceKernelDcacheWritebackRange(baseaddr, ((char*)endptr) - ((char*)baseaddr));
      sceKernelIcacheInvalidateRange(baseaddr, ((char*)endptr) - ((char*)baseaddr));
-@@ -3383,14 +3392,27 @@ void flush_translation_cache_rom(void)
+@@ -3343,6 +3355,9 @@ void flush_translation_cache_ram(void)
+ {
+   /* Flushes RAM caches avoiding doing too much work (ie. wiping unused memory) */
+   flush_ram_count++;
++#if defined(BBK9588)
++  bbk9588_ram_flushes++;
++#endif
+   /*printf("ram flush %d (pc %x), %x to %x, %x to %x\n",
+    flush_ram_count, reg[REG_PC], iwram_code_min, iwram_code_max,
+    ewram_code_min, ewram_code_max);*/
+@@ -3380,17 +3395,36 @@ void flush_translation_cache_ram(void)
+ void flush_translation_cache_rom(void)
+ {
+   /* We flush the generated code except for everything below the watermark. */
++#if defined(BBK9588)
++  bbk9588_rom_flushes++;
++#endif
    last_rom_translation_ptr = &rom_translation_cache[rom_cache_watermark];
    rom_translation_ptr      = &rom_translation_cache[rom_cache_watermark];
  
@@ -67,6 +93,9 @@ index 8942ab3..f9aa383 100644
  void init_dynarec_caches(void)
  {
 +#if defined(BBK9588)
++  bbk9588_rom_flushes = 0;
++  bbk9588_ram_flushes = 0;
++  bbk9588_proactive_flushes = 0;
 +  if (!rom_branch_hash)
 +    rom_branch_hash = (u32*)malloc(ROM_BRANCH_HASH_SIZE * sizeof(*rom_branch_hash));
 +  if (!rom_branch_hash)
@@ -80,7 +109,7 @@ index 8942ab3..f9aa383 100644
  
    ram_translation_ptr = last_ram_translation_ptr = &ram_translation_cache[0];
    memset(iwram, 0, 0x8000);
-@@ -3402,6 +3424,14 @@ void init_dynarec_caches(void)
+@@ -3402,6 +3436,14 @@ void init_dynarec_caches(void)
    iwram_code_max = 0x8000;
  }
  
@@ -95,11 +124,48 @@ index 8942ab3..f9aa383 100644
  void flush_dynarec_caches(void)
  {
    /* Flush ROM and RAM caches. */
+@@ -3413,3 +3455,36 @@ void flush_dynarec_caches(void)
+   flush_translation_cache_ram();
+ }
+ 
++#if defined(BBK9588)
++void bbk9588_drc_frame_maintenance(void)
++{
++  u32 rom_used;
++  u32 ram_used;
++
++  if (!rom_translation_cache || !ram_translation_cache)
++    return;
++
++  rom_used = (u32)(rom_translation_ptr - rom_translation_cache);
++  ram_used = (u32)(ram_translation_ptr - ram_translation_cache);
++  if (rom_used < (ROM_TRANSLATION_CACHE_SIZE * 3U) / 4U &&
++      ram_used < (RAM_TRANSLATION_CACHE_SIZE * 3U) / 4U)
++    return;
++
++  /* Recover at a libretro frame boundary, never from nested translation. */
++  bbk9588_proactive_flushes++;
++  flush_dynarec_caches();
++}
++
++void bbk9588_drc_get_stats(u32 *rom_used, u32 *ram_used,
++                           u32 *rom_flushes, u32 *ram_flushes,
++                           u32 *proactive_flushes)
++{
++  *rom_used = rom_translation_cache
++      ? (u32)(rom_translation_ptr - rom_translation_cache) : 0U;
++  *ram_used = ram_translation_cache
++      ? (u32)(ram_translation_ptr - ram_translation_cache) : 0U;
++  *rom_flushes = bbk9588_rom_flushes;
++  *ram_flushes = bbk9588_ram_flushes;
++  *proactive_flushes = bbk9588_proactive_flushes;
++}
++#endif
 diff --git a/gba_memory.c b/gba_memory.c
-index f89567a..ab50f83 100644
+index f89567a..cfeb686 100644
 --- a/gba_memory.c
 +++ b/gba_memory.c
-@@ -18,6 +18,14 @@
+@@ -18,6 +18,21 @@
   */
  
  #include "common.h"
@@ -108,13 +174,20 @@ index f89567a..ab50f83 100644
 +extern void bbk9588_load_trace(const char *stage, unsigned value);
 +#define BBK_LOAD_TRACE(stage, value) bbk9588_load_trace((stage), (value))
 +static unsigned bbk9588_page_trace_count;
++volatile u32 bbk9588_page_load_count;
++volatile u32 bbk9588_page_load_last;
++volatile u32 bbk9588_page_io_stage;
++volatile u32 bbk9588_page_host_safe_count;
++volatile u32 bbk9588_drc_context_sp;
++volatile u32 bbk9588_drc_reg_base;
++volatile u32 bbk9588_drc_active;
 +#else
 +#define BBK_LOAD_TRACE(stage, value) ((void)0)
 +#endif
  #include "streams/file_stream.h"
  
  /* Sound */
-@@ -342,7 +350,11 @@ const u32 def_seq_cycles[16][2] =
+@@ -342,7 +357,11 @@ const u32 def_seq_cycles[16][2] =
  u8 bios_rom[1024 * 16];
  
  // Up to 128kb, store SRAM, flash ROM, or EEPROM here.
@@ -126,8 +199,15 @@ index f89567a..ab50f83 100644
  
  u32 dma_bus_val;
  dma_transfer_type dma[4];
-@@ -2237,6 +2249,18 @@ static u32 evict_gamepak_page(void)
+@@ -2234,11 +2253,35 @@ static u32 evict_gamepak_page(void)
+   return ret;
+ }
+ 
++#if defined(BBK9588) && defined(HAVE_DYNAREC)
++u8 *bbk9588_load_gamepak_page_io(u32 physical_index)
++#else
  u8 *load_gamepak_page(u32 physical_index)
++#endif
  {
    u32 rom_blocks = gamepak_size >> 15;
 +  u32 file_index;
@@ -136,6 +216,9 @@ index f89567a..ab50f83 100644
 +  int64_t read_len;
 +#if defined(BBK9588)
 +  bool trace_page = bbk9588_page_trace_count < 4;
++  bbk9588_page_load_count++;
++  bbk9588_page_load_last = physical_index;
++  bbk9588_page_io_stage = 1;
 +  if (trace_page)
 +  {
 +    bbk9588_page_trace_count++;
@@ -143,9 +226,16 @@ index f89567a..ab50f83 100644
 +  }
 +#endif
    if (rom_blocks == 0)
++  {
++#if defined(BBK9588)
++    bbk9588_page_io_stage = 0;
++#endif
      return &gamepak_buffers[0][0];
++  }
  
-@@ -2253,19 +2277,51 @@ u8 *load_gamepak_page(u32 physical_index)
+   // Mirror accesses that land outside the physical ROM size.
+   // Classic NES/Famicom Mini titles rely on this behavior extensively.
+@@ -2253,30 +2296,78 @@ u8 *load_gamepak_page(u32 physical_index)
    // Fill in the entry
    gamepak_blk_queue[entry].phy_rom = physical_index;
  
@@ -162,20 +252,22 @@ index f89567a..ab50f83 100644
 +#endif
 +  seek_result = filestream_seek(gamepak_file_large, target, SEEK_SET);
 +#if defined(BBK9588)
++  bbk9588_page_io_stage = 2;
 +  if (trace_page)
 +    BBK_LOAD_TRACE("PAGE_SEEK_END", (u32)seek_result);
 +#endif
 +  if (seek_result != (int64_t)target)
-   {
--    u32 read_len = (u32)filestream_read(gamepak_file_large, swap_location, (32 * 1024));
--    if (read_len < (32 * 1024))
++  {
 +    memset(swap_location, 0xFF, 32 * 1024);
 +    BBK_LOAD_TRACE("PAGE_SEEK_ERROR", (u32)seek_result);
 +  }
 +  else
-+  {
+   {
+-    u32 read_len = (u32)filestream_read(gamepak_file_large, swap_location, (32 * 1024));
+-    if (read_len < (32 * 1024))
 +    read_len = filestream_read(gamepak_file_large, swap_location, 32 * 1024);
 +#if defined(BBK9588)
++    bbk9588_page_io_stage = 3;
 +    if (trace_page)
 +      BBK_LOAD_TRACE("PAGE_READ_END", (u32)read_len);
 +#endif
@@ -201,12 +293,24 @@ index f89567a..ab50f83 100644
  
    // When mapping page 0, we might need to reflect the GPIO regs.
    if (physical_index == 0)
-@@ -2277,6 +2333,12 @@ u8 *load_gamepak_page(u32 physical_index)
+     update_gpio_romregs();
+ 
++#if defined(BBK9588)
++  bbk9588_page_io_stage = 0;
++#endif
++
+   return swap_location;
+ }
+ 
  void init_gamepak_buffer(void)
  {
    unsigned i;
 +#if defined(BBK9588)
 +  bbk9588_page_trace_count = 0;
++  bbk9588_page_load_count = 0;
++  bbk9588_page_load_last = 0;
++  bbk9588_page_io_stage = 0;
++  bbk9588_page_host_safe_count = 0;
 +  if (!gamepak_backup)
 +    gamepak_backup = (u8*)malloc(GAMEPAK_BACKUP_SIZE);
 +#endif
@@ -214,7 +318,7 @@ index f89567a..ab50f83 100644
    // Try to allocate up to 32 blocks of 1MB each
    gamepak_buffer_count = 0;
    while (gamepak_buffer_count < ROM_BUFFER_SIZE)
-@@ -2390,6 +2452,14 @@ void memory_term(void)
+@@ -2390,6 +2481,14 @@ void memory_term(void)
      gamepak_mini_rom = NULL;
    }
    gamepak_mini_materialized = false;
@@ -229,7 +333,7 @@ index f89567a..ab50f83 100644
  }
  
  bool memory_check_savestate(const u8 *src)
-@@ -2593,6 +2663,7 @@ static s32 load_gamepak_raw(const char *name)
+@@ -2593,6 +2692,7 @@ static s32 load_gamepak_raw(const char *name)
    int64_t fsize;
    gamepak_file_large = filestream_open(name, RETRO_VFS_FILE_ACCESS_READ,
                                         RETRO_VFS_FILE_ACCESS_HINT_NONE);
@@ -237,7 +341,7 @@ index f89567a..ab50f83 100644
    if(gamepak_file_large)
    {
      if (gamepak_mini_rom)
-@@ -2614,6 +2685,7 @@ static s32 load_gamepak_raw(const char *name)
+@@ -2614,6 +2714,7 @@ static s32 load_gamepak_raw(const char *name)
        return -1;
      }
      raw_size = (u32)fsize;
@@ -245,7 +349,7 @@ index f89567a..ab50f83 100644
  
      // Round size to 32KB pages
      raw_size = (raw_size + 0x7FFF) & ~0x7FFF;
-@@ -2683,6 +2755,7 @@ static s32 load_gamepak_raw(const char *name)
+@@ -2683,6 +2784,7 @@ static s32 load_gamepak_raw(const char *name)
        // Load 1MB chunk and map it
        {
          u32 read_len = (u32)filestream_read(gamepak_file_large, gamepak_buffers[i], gamepak_buffer_blocksize);
@@ -253,7 +357,7 @@ index f89567a..ab50f83 100644
          if (read_len < gamepak_buffer_blocksize)
            memset(gamepak_buffers[i] + read_len, 0xFF, gamepak_buffer_blocksize - read_len);
        }
-@@ -2695,8 +2768,9 @@ static s32 load_gamepak_raw(const char *name)
+@@ -2695,8 +2797,9 @@ static s32 load_gamepak_raw(const char *name)
          // Map it to the read handlers now
          map_rom_entry(read, phyn, blkptr, rom_blocks);
        }
@@ -264,7 +368,7 @@ index f89567a..ab50f83 100644
      return 0;
    }
  
-@@ -2874,6 +2948,7 @@ u32 load_gamepak(const struct retro_game_info* info, const char *name,
+@@ -2874,6 +2977,7 @@ u32 load_gamepak(const struct retro_game_info* info, const char *name,
  
     if (load_gamepak_raw(name))
        return -1;
@@ -272,7 +376,7 @@ index f89567a..ab50f83 100644
  
     gamepak_header_nonstandard =
        (gamepak_buffers[0][3] != 0xEA) || (gamepak_buffers[0][0xB2] != 0x96);
-@@ -2916,6 +2991,7 @@ u32 load_gamepak(const struct retro_game_info* info, const char *name,
+@@ -2916,6 +3020,7 @@ u32 load_gamepak(const struct retro_game_info* info, const char *name,
        u32 scan_size = gamepak_size < (1024*1024) ? gamepak_size : (1024*1024);
        detect_backup_subcircuit(gamepak_buffers[0], scan_size);
     }
@@ -280,7 +384,7 @@ index f89567a..ab50f83 100644
  
     bool is_128k_flash = (backup_type_reset == BACKUP_FLASH && flash_bank_cnt == FLASH_SIZE_128KB);
     bool is_pokemon_engine = rom_is_pokemon_family(gamepak_buffers[0]) || is_128k_flash;
-@@ -2991,6 +3067,7 @@ u32 load_gamepak(const struct retro_game_info* info, const char *name,
+@@ -2991,6 +3096,7 @@ u32 load_gamepak(const struct retro_game_info* info, const char *name,
      * rtc_base_time, both of which are persisted in the savestate. */
     rtc_init_base_time();
  
@@ -289,10 +393,26 @@ index f89567a..ab50f83 100644
  }
  
 diff --git a/gba_memory.h b/gba_memory.h
-index 50472a3..71e0b5b 100644
+index 50472a3..70d8b82 100644
 --- a/gba_memory.h
 +++ b/gba_memory.h
-@@ -309,7 +309,12 @@ extern u32 sram_bankcount;
+@@ -255,6 +255,15 @@ void init_gamepak_buffer(void);
+ bool gamepak_must_swap(void);
+ void memory_term(void);
+ u8 *load_gamepak_page(u32 physical_index);
++#if defined(BBK9588)
++extern volatile u32 bbk9588_page_load_count;
++extern volatile u32 bbk9588_page_load_last;
++extern volatile u32 bbk9588_page_io_stage;
++extern volatile u32 bbk9588_page_host_safe_count;
++extern volatile u32 bbk9588_drc_context_sp;
++extern volatile u32 bbk9588_drc_reg_base;
++extern volatile u32 bbk9588_drc_active;
++#endif
+ 
+ extern u32 oam_update;
+ extern u32 gbc_sound_wave_update;
+@@ -309,7 +318,12 @@ extern u32 sram_bankcount;
  extern u32 flash_bank_cnt;
  extern u32 eeprom_size;
  
@@ -353,7 +473,7 @@ index 1574e51..f2cbef3 100644
  }
 -
 diff --git a/libretro/libretro.c b/libretro/libretro.c
-index 5f02c09..365bf82 100644
+index 5f02c09..5b1deaf 100644
 --- a/libretro/libretro.c
 +++ b/libretro/libretro.c
 @@ -120,6 +120,25 @@ static void info_msg(const char* text)
@@ -431,7 +551,7 @@ index 5f02c09..365bf82 100644
     if (load_gamepak(info, info->path, rtc_mode, rumble_mode, serial_setting) != 0)
     {
        error_msg("Could not load the game file.");
-@@ -1290,12 +1326,25 @@ size_t retro_get_memory_size(unsigned id)
+@@ -1290,12 +1326,32 @@ size_t retro_get_memory_size(unsigned id)
     return 0;
  }
  
@@ -449,15 +569,22 @@ index 5f02c09..365bf82 100644
     bool updated = false;
  
 +   BBK_RUN_TRACE("RUN_ENTER", 1);
-+#if !defined(BBK9588)
++#if defined(BBK9588)
++   bbk9588_poll_input();
++#else
     input_poll_cb();
     update_input();
 +#endif
 +   BBK_RUN_TRACE("RUN_INPUT_DONE", 2);
++
++#if defined(BBK9588) && defined(HAVE_DYNAREC)
++   if (dynarec_enable)
++      bbk9588_drc_frame_maintenance();
++#endif
  
     rumble_frame_reset();
  
-@@ -1370,6 +1419,7 @@ void retro_run(void)
+@@ -1370,6 +1426,7 @@ void retro_run(void)
     }
  
     /* This runs just a frame */
@@ -465,7 +592,7 @@ index 5f02c09..365bf82 100644
     #ifdef HAVE_DYNAREC
     if (dynarec_enable)
        execute_arm_translate(execute_cycles);
-@@ -1380,6 +1430,7 @@ void retro_run(void)
+@@ -1380,6 +1437,7 @@ void retro_run(void)
        clear_gamepak_stickybits();
        execute_arm(execute_cycles);
     }
@@ -473,7 +600,7 @@ index 5f02c09..365bf82 100644
  
     if (rumble_cb) {
       // TODO: Add some user-option to select a rumble policy
-@@ -1388,8 +1439,12 @@ void retro_run(void)
+@@ -1388,8 +1446,12 @@ void retro_run(void)
       rumble_cb(0, RETRO_RUMBLE_STRONG, MIN(strength, 0xffff) / 2);
     }
  
@@ -486,7 +613,7 @@ index 5f02c09..365bf82 100644
  
     switch (serial_mode) {
     case SERIAL_MODE_RFU:
-@@ -1402,6 +1457,11 @@ void retro_run(void)
+@@ -1402,6 +1464,11 @@ void retro_run(void)
  
     if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
        check_variables(false);
@@ -499,49 +626,18 @@ index 5f02c09..365bf82 100644
  
  unsigned retro_api_version(void)
 diff --git a/main.c b/main.c
-index 6fb26fc..62a39cb 100644
+index 6fb26fc..671213f 100644
 --- a/main.c
 +++ b/main.c
-@@ -36,6 +36,12 @@ char main_path[512];
- 
- static u32 random_state = 0;
- 
-+#if defined(BBK9588)
-+#define BBK9588_INPUT_POLL_CYCLES 16384u
-+static u32 bbk9588_input_cycle_accumulator;
-+extern void bbk9588_poll_input(void);
-+#endif
-+
- // Generate 16 random bits.
- u16 rand_gen() {
-   random_state = ((random_state * 1103515245) + 12345) & 0x7fffffff;
-@@ -110,6 +116,9 @@ void init_main(void)
+@@ -110,7 +110,6 @@ void init_main(void)
    cpu_ticks = 0;
    execute_cycles = 960;
    video_count = 960;
-+#if defined(BBK9588)
-+  bbk9588_input_cycle_accumulator = BBK9588_INPUT_POLL_CYCLES;
-+#endif
- 
+-
  #ifdef HAVE_DYNAREC
    init_dynarec_caches();
-@@ -137,6 +146,15 @@ u32 function_cc update_gba(int remaining_cycles)
- 
-     remaining_cycles = 0;
- 
-+#if defined(BBK9588)
-+    bbk9588_input_cycle_accumulator += completed_cycles;
-+    if (bbk9588_input_cycle_accumulator >= BBK9588_INPUT_POLL_CYCLES)
-+    {
-+      bbk9588_input_cycle_accumulator %= BBK9588_INPUT_POLL_CYCLES;
-+      bbk9588_poll_input();
-+    }
-+#endif
-+
-     // Timers can trigger DMA (usually sound) and consume cycles
-     dma_cycles = update_timers(&irq_raised, completed_cycles);
-     // Check for serial port IRQs as well.
-@@ -452,4 +470,3 @@ unsigned main_write_savestate(u8* dst)
+   init_emitter(gamepak_must_swap());
+@@ -452,4 +451,3 @@ unsigned main_write_savestate(u8* dst)
  
    return (unsigned int)(dst - startp);
  }
@@ -661,7 +757,7 @@ index 79d5183..e374916 100644
      mips_emit_jr(reg_rv);                       // Jump directly to target for speed
      mips_emit_cache(0x08, mips_reg_ra, -8);
 diff --git a/mips/mips_stub.S b/mips/mips_stub.S
-index 34b0446..62e9a4b 100644
+index 34b0446..961ba16 100644
 --- a/mips/mips_stub.S
 +++ b/mips/mips_stub.S
 @@ -25,7 +25,11 @@
@@ -677,23 +773,13 @@ index 34b0446..62e9a4b 100644
    #define SZREG 4
    #define REG_L lw
    #define REG_S sw
-@@ -130,6 +134,34 @@ symbol:
+@@ -130,6 +134,156 @@ symbol:
  .set noat
  .set noreorder
  
 +#if defined(BBK9588)
 +  # JZ4740 is MIPS32 Release 1. Do not use the Release 2 di/ehb
 +  # instructions here: QEMU's 24Kf accepts them, but real hardware does not.
-+  .macro bbk_restore_host_irqs
-+    REG_L $28, GP_SAVE($16)       # Restore the application GP before IRQs fire
-+    REG_L $8, 14*SZREG($sp)
-+    mtc0 $8, $12
-+    nop
-+    nop
-+    nop
-+    nop
-+  .endm
-+
 +  .macro bbk_disable_host_irqs
 +    # k0/k1 may be destroyed by an IRQ before Status.IE is cleared. Use
 +    # ordinary caller-saved registers, which the firmware exception frame
@@ -707,36 +793,177 @@ index 34b0446..62e9a4b 100644
 +    nop
 +    nop
 +  .endm
++
++  .macro bbk_call_update_gba
++    # The firmware may schedule while IRQs are open. Present a complete host
++    # callee-saved context instead of the GBA registers used by the DRC.
++    REG_S $16, 15*SZREG($sp)
++    REG_S reg_cycles, 16*SZREG($sp)
++    REG_S $s3, 17*SZREG($sp)
++    REG_S $s4, 18*SZREG($sp)
++    REG_S $s5, 19*SZREG($sp)
++    REG_S $s6, 20*SZREG($sp)
++    REG_S $s7, 21*SZREG($sp)
++  #ifdef PIC
++    REG_L $25, FNPTRS_BASE($16)
++  #endif
++    REG_L $28, GP_SAVE($16)
++    REG_L $s0,  4*SZREG($sp)
++    REG_L $s1,  5*SZREG($sp)
++    REG_L $s2,  6*SZREG($sp)
++    REG_L $s3,  7*SZREG($sp)
++    REG_L $s4,  8*SZREG($sp)
++    REG_L $s5,  9*SZREG($sp)
++    REG_L $s6, 10*SZREG($sp)
++    REG_L $s7, 11*SZREG($sp)
++    REG_L $fp, 12*SZREG($sp)
++    REG_L $ra, 13*SZREG($sp)
++    REG_L $8, 14*SZREG($sp)
++    mtc0 $8, $12
++    nop
++    nop
++    nop
++    nop
++    REG_L $4, 16*SZREG($sp)
++  #ifdef PIC
++    jalr $25
++    nop
++  #else
++    jal update_gba
++    nop
++  #endif
++    bbk_disable_host_irqs
++    REG_L $16, 15*SZREG($sp)
++    REG_L $s3, 17*SZREG($sp)
++    REG_L $s4, 18*SZREG($sp)
++    REG_L $s5, 19*SZREG($sp)
++    REG_L $s6, 20*SZREG($sp)
++    REG_L $s7, 21*SZREG($sp)
++  .endm
++#endif
++
++#if defined(BBK9588)
++  # Runtime ROM misses can originate in generated code as well as nested core
++  # callbacks. Run firmware file I/O with a complete host register context and
++  # restore the caller's exact IRQ state so nested calls remain safe.
++  .align 4
++defsymbl(load_gamepak_page)
++  la $8, bbk9588_drc_active
++  lw $9, 0($8)
++  bnez $9, 1f
++  nop
++  j bbk9588_load_gamepak_page_io
++  nop
++
++1:
++  addiu $sp, $sp, -64
++  REG_S $4,   0*SZREG($sp)
++  REG_S $s0,  1*SZREG($sp)
++  REG_S $s1,  2*SZREG($sp)
++  REG_S $s2,  3*SZREG($sp)
++  REG_S $s3,  4*SZREG($sp)
++  REG_S $s4,  5*SZREG($sp)
++  REG_S $s5,  6*SZREG($sp)
++  REG_S $s6,  7*SZREG($sp)
++  REG_S $s7,  8*SZREG($sp)
++  REG_S $fp,  9*SZREG($sp)
++  REG_S $gp, 10*SZREG($sp)
++  REG_S $ra, 11*SZREG($sp)
++  mfc0 $8, $12
++  REG_S $8, 12*SZREG($sp)
++
++  la $8, bbk9588_page_host_safe_count
++  lw $9, 0($8)
++  addiu $9, $9, 1
++  sw $9, 0($8)
++
++  la $8, bbk9588_drc_context_sp
++  lw $8, 0($8)
++  REG_L $s0,  4*SZREG($8)
++  REG_L $s1,  5*SZREG($8)
++  REG_L $s2,  6*SZREG($8)
++  REG_L $s3,  7*SZREG($8)
++  REG_L $s4,  8*SZREG($8)
++  REG_L $s5,  9*SZREG($8)
++  REG_L $s6, 10*SZREG($8)
++  REG_L $s7, 11*SZREG($8)
++  REG_L $fp, 12*SZREG($8)
++  REG_L $ra, 13*SZREG($8)
++  la $9, bbk9588_drc_reg_base
++  lw $9, 0($9)
++  REG_L $gp, GP_SAVE($9)
++  REG_L $9, 14*SZREG($8)
++  mtc0 $9, $12
++  nop
++  nop
++  nop
++  nop
++
++  REG_L $4, 0*SZREG($sp)
++  jal bbk9588_load_gamepak_page_io
++  nop
++
++  # Restore the status observed at wrapper entry. This may be enabled when a
++  # page miss is nested inside update_gba(), or masked for a direct JIT miss.
++  REG_L $8, 12*SZREG($sp)
++  mtc0 $8, $12
++  nop
++  nop
++  nop
++  nop
++  REG_L $s0,  1*SZREG($sp)
++  REG_L $s1,  2*SZREG($sp)
++  REG_L $s2,  3*SZREG($sp)
++  REG_L $s3,  4*SZREG($sp)
++  REG_L $s4,  5*SZREG($sp)
++  REG_L $s5,  6*SZREG($sp)
++  REG_L $s6,  7*SZREG($sp)
++  REG_L $s7,  8*SZREG($sp)
++  REG_L $fp,  9*SZREG($sp)
++  REG_L $gp, 10*SZREG($sp)
++  REG_L $ra, 11*SZREG($sp)
++  addiu $sp, $sp, 64
++  jr $ra
++  nop
 +#endif
 +
  # make sure $16 has the register base for these macros
  
  #ifdef MIPS_HAS_R2_INSTS
-@@ -245,9 +277,16 @@ defsymbl(mips_update_gba)
+@@ -245,8 +399,12 @@ defsymbl(mips_update_gba)
    sw $ra, REG_SAVE2($16)          # save return addr
    collapse_flags                  # update cpsr
    save_registers                  # save registers
+-  move $4, reg_cycles             # Remaining cycles as asg0
+-  cfncall update_gba, 0           # process the next event
 +#if defined(BBK9588)
-+  bbk_restore_host_irqs            # Service firmware IRQs with the application GP
++  bbk_call_update_gba              # Run pure core callbacks with host IRQ service
++#else
++  move $4, reg_cycles              # Remaining cycles as asg0
++  cfncall update_gba, 0            # process the next event
 +#endif
-   move $4, reg_cycles             # Remaining cycles as asg0
-   cfncall update_gba, 0           # process the next event
  
-+#if defined(BBK9588)
-+  bbk_disable_host_irqs            # Protect the guest register mapping again
-+#endif
-+
    bltz $2, return_to_main         # Exit if a frame is complete (bit 31 is set)
  
-   and reg_cycles, $2, 0x7FFF      # update new cycle count (ret value)
-@@ -287,8 +326,20 @@ return_to_main:
+@@ -276,6 +434,10 @@ defsymbl(mips_cheat_hook)
+ # Loads the main context and returns to it.
+ # ARM regs must be saved before branching here
+ return_to_main:
++#if defined(BBK9588)
++  la $8, bbk9588_drc_active
++  sw $0, 0($8)
++#endif
+   REG_L $28, GP_SAVE($16)            # Restore previous state
+   REG_L $s0,  4*SZREG($sp)
+   REG_L $s1,  5*SZREG($sp)
+@@ -287,8 +449,20 @@ return_to_main:
    REG_L $s7, 11*SZREG($sp)
    REG_L $fp, 12*SZREG($sp)
    REG_L $ra, 13*SZREG($sp)
 +#if defined(BBK9588)
 +  REG_L $8, 14*SZREG($sp)         # Stage Status after restoring host context
 +  addiu $sp, $sp, 112             # Restore the caller's stack before IRQs
-+  mtc0 $8, $12                    # Re-enable IRQs only at the frame boundary
++  mtc0 $8, $12                    # Re-enable IRQs only at a complete host boundary
 +  nop
 +  nop
 +  nop
@@ -750,27 +977,33 @@ index 34b0446..62e9a4b 100644
  
  # Perform an indirect branch.
  
-@@ -342,8 +393,15 @@ defsymbl(write_io_epilogue)
+@@ -341,8 +515,12 @@ defsymbl(write_io_epilogue)
+   # Purposely fallthrough to cpu_sleep_loop, wait for CPU wakeup
  
  cpu_sleep_loop:
-   move $4, reg_cycles             # Remaining cycles as asg0
+-  move $4, reg_cycles             # Remaining cycles as asg0
+-  cfncall update_gba, 0           # process the next event
 +#if defined(BBK9588)
-+  bbk_restore_host_irqs            # Service firmware IRQs while the GBA CPU sleeps
++  bbk_call_update_gba              # Run pure core callbacks with host IRQ service
++#else
++  move $4, reg_cycles              # Remaining cycles as asg0
++  cfncall update_gba, 0            # process the next event
 +#endif
-   cfncall update_gba, 0           # process the next event
  
-+#if defined(BBK9588)
-+  bbk_disable_host_irqs            # Re-enter the protected DRC context
-+#endif
-+
    bltz $2, return_to_main         # Exit if a frame is complete (bit 31 is set)
  
-   # since no frame was completed, this means CPU is active again.
-@@ -522,6 +580,17 @@ defsymbl(execute_arm_translate_internal)
+@@ -522,6 +700,24 @@ defsymbl(execute_arm_translate_internal)
    REG_S $s7, 11*SZREG($sp)
    REG_S $fp, 12*SZREG($sp)
    REG_S $ra, 13*SZREG($sp)
 +#if defined(BBK9588)
++  la $8, bbk9588_drc_context_sp
++  sw $sp, 0($8)
++  la $8, bbk9588_drc_reg_base
++  sw $5, 0($8)
++  la $8, bbk9588_drc_active
++  addiu $9, $0, 1
++  sw $9, 0($8)
 +  mfc0 $8, $12
 +  REG_S $8, 14*SZREG($sp)         # Preserve the caller's CP0 Status
 +  addiu $9, $0, -2
@@ -784,7 +1017,7 @@ index 34b0446..62e9a4b 100644
  
    move $16, $5
    REG_S $28, GP_SAVE($16)
-@@ -633,4 +702,3 @@ defsymbl(ram_translation_cache)
+@@ -633,4 +829,3 @@ defsymbl(ram_translation_cache)
  #if defined(__linux__) && defined(__ELF__)
    .section .note.GNU-stack,"",%progbits
  #endif
