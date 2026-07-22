@@ -31,6 +31,36 @@ Copy-Item .\tests\roms\fixtures.local.example.psd1 `
 首批回归覆盖 ARM、Thumb、内存、基础 PPU、无存档、SRAM、Flash 64K 和 Flash 128K。
 EEPROM 不在该套件内，仍需补一份可重新构建的独立 fixture。
 
+安装 `bbk9588-emulator-v0.1.5` 后，可以把这些 ROM 逐个送入 DRC headless BDA，执行
+120 帧并导出日志。`public-fixtures.psd1` 固定 120 帧时的整段视频 hash、最终画面 hash、
+PC 和 CPSR；每个最终画面已经人工检查并记录预期内容，脚本会拒绝任何未确认的行为漂移。
+这仍是 gpSP 当前行为基线，不等同于独立参考实现给出的全正确结论。它只使用模拟器的专用
+`runtime\bda_test` NAND，不修改原始镜像；模拟器和 NAND 不会进入仓库或 CI。
+每项最后一帧同时导出为 `240x160` little-endian RGB565 文件，供语义结果检查使用。
+
+| Fixture | DRC 最终画面 | 结论 |
+|---|---|---|
+| ARM | `Failed test 225` | 与上游 gpSP 解释器一致 |
+| Thumb | `Failed test 227` | BBK MIPS DRC 已通过解释器停留的 211，空 rlist 停在 227 |
+| Memory | `All tests passed` | 通过 |
+| PPU Hello | `Hello world!` | 通过 |
+| PPU Shades | 蓝色渐变色带 | 通过 |
+| PPU Stripes | 蓝色竖向交替条纹 | 通过 |
+| Save None | `All tests passed` | 通过 |
+| SRAM | `Failed test 006` | 与上游 gpSP 解释器一致 |
+| Flash 64K | `Failed test 006` | 与上游 gpSP 解释器一致 |
+| Flash 128K | `Failed test 006` | 与上游 gpSP 解释器一致 |
+
+```powershell
+$env:BBK9588_EMULATOR_ROOT = 'E:\bbk9588-emulator-v0.1.5'
+.\tools\test_public_roms_in_emulator.ps1 -ResetImage
+```
+
+用 `-Fixture Arm,Thumb` 可只运行指定项。结果保存在被 Git 忽略的
+`tests\output\public-roms\dynarec\`。使用 `-Core Interpreter` 可运行 gpSP 解释器，并将
+输出放在 `tests\output\public-roms\interpreter\`；解释器模式不套用生产 DRC 签名。使用
+`-Core PatchedInterpreter` 可在关闭 DRC 时保留全部 BBK C 补丁，用于定位差异来源。
+
 ## 私有兼容性测试建议
 
 1. Bring-up：加载 ROM，执行至少 300 帧，确认画面不是全黑且 core 没有崩溃。

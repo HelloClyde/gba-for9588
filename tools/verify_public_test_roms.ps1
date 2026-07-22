@@ -48,6 +48,25 @@ foreach ($entry in $fixtures.GetEnumerator() | Sort-Object Key) {
         throw "Public fixture '$name' SHA-256 mismatch: expected $expectedHash, got $actualHash"
     }
 
+    if ([string]::IsNullOrWhiteSpace([string]$fixture.ExpectedScreen)) {
+        throw "Public fixture '$name' has no ExpectedScreen description"
+    }
+
+    $baseline = $fixture.Headless120
+    $baselineFields = @('VideoHash', 'VideoLastHash', 'GbaPc', 'GbaCpsr')
+    if (-not ($baseline -is [Collections.IDictionary])) {
+        throw "Public fixture '$name' has no Headless120 baseline"
+    }
+    if ($baseline.Count -ne $baselineFields.Count) {
+        throw "Public fixture '$name' Headless120 baseline must contain exactly: $($baselineFields -join ', ')"
+    }
+    foreach ($field in $baselineFields) {
+        $value = [string]$baseline[$field]
+        if (-not $baseline.Contains($field) -or $value -notmatch '^[0-9A-Fa-f]{8}$') {
+            throw "Public fixture '$name' has invalid Headless120.$field value: '$value'"
+        }
+    }
+
     $header = [byte[]]::new(0xC0)
     $stream = [IO.File]::OpenRead($romPath)
     try {
@@ -62,6 +81,7 @@ foreach ($entry in $fixtures.GetEnumerator() | Sort-Object Key) {
     [pscustomobject]@{
         Name = $name
         Category = [string]$fixture.Category
+        ExpectedScreen = [string]$fixture.ExpectedScreen
         Size = $file.Length
         SHA256 = $actualHash
         Path = $file.FullName

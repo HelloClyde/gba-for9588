@@ -18,6 +18,9 @@ extern u8 *ram_translation_cache;
 #endif
 
 #define HEADLESS_LOG_INTERVAL 60u
+#define HEADLESS_VIDEO_WIDTH 240u
+#define HEADLESS_VIDEO_HEIGHT 160u
+#define HEADLESS_VIDEO_PIXELS (HEADLESS_VIDEO_WIDTH * HEADLESS_VIDEO_HEIGHT)
 #define GPSP_REG_PC 15u
 #define GPSP_REG_CPSR 16u
 
@@ -29,12 +32,13 @@ static u32 g_video_hash = 2166136261u;
 static u32 g_video_nonzero;
 static u32 g_video_last_hash;
 static u32 g_video_changed_frames;
+static u16 g_video_last_frame[HEADLESS_VIDEO_PIXELS];
 static u32 g_audio_frames;
 static u32 g_audio_hash = 2166136261u;
 
 static int open_log(const char *mode)
 {
-    return bda_fs_fopen_raw("GPSPHL.LOG", mode);
+    return bda_fs_fopen_raw("A:\\GAMEBOY\\GPSPHL.LOG", mode);
 }
 
 static void log_text(const char *text)
@@ -54,6 +58,24 @@ static void log_hex(const char *label, u32 value)
     if (length > 0) {
         log_text(line);
     }
+}
+
+static int write_video_frame(void)
+{
+    int file;
+    int written;
+    int closed;
+    if (g_video_frames == 0u) {
+        return 0;
+    }
+    file = bda_fs_fopen_raw("A:\\GAMEBOY\\GPSPHL.RAW", "wb");
+    if (!bda_fs_file_is_valid(file)) {
+        return 0;
+    }
+    written = bda_fs_write_raw(file, g_video_last_frame,
+        (bda_size_t)sizeof(g_video_last_frame));
+    closed = bda_fs_close_raw(file);
+    return written == (int)sizeof(g_video_last_frame) && closed == 0;
 }
 
 static void frontend_log(enum retro_log_level level, const char *format, ...)
@@ -133,7 +155,8 @@ static void video_callback(
     const u8 *row = (const u8 *)data;
     u32 frame_hash = 2166136261u;
     unsigned y;
-    if (!data || width != 240u || height != 160u || pitch < width * 2u) {
+    if (!data || width != HEADLESS_VIDEO_WIDTH ||
+        height != HEADLESS_VIDEO_HEIGHT || pitch < width * 2u) {
         return;
     }
     ++g_video_frames;
@@ -142,6 +165,7 @@ static void video_callback(
         unsigned x;
         for (x = 0; x < width; ++x) {
             u16 pixel = pixels[x];
+            g_video_last_frame[y * HEADLESS_VIDEO_WIDTH + x] = pixel;
             g_video_hash = (g_video_hash ^ pixel) * 16777619u;
             frame_hash = (frame_hash ^ pixel) * 16777619u;
             if (pixel != 0u) {
@@ -188,6 +212,7 @@ int bda_main(void)
     u32 frame;
     int loaded;
     int ok;
+    int video_frame_written;
 
     if (bda_fs_file_is_valid(file)) {
         (void)bda_fs_close_raw(file);
@@ -203,6 +228,7 @@ int bda_main(void)
     g_video_nonzero = 0;
     g_video_last_hash = 0u;
     g_video_changed_frames = 0u;
+    memset(g_video_last_frame, 0, sizeof(g_video_last_frame));
     g_audio_frames = 0;
     g_audio_hash = 2166136261u;
 
@@ -247,6 +273,7 @@ int bda_main(void)
         retro_unload_game();
     }
     retro_deinit();
+    video_frame_written = write_video_frame();
 
     log_hex("VIDEO_FRAMES=", g_video_frames);
     log_hex("VIDEO_HASH=", g_video_hash);
@@ -257,8 +284,9 @@ int bda_main(void)
     log_hex("AUDIO_HASH=", g_audio_hash);
     log_hex("GBA_PC=", reg[GPSP_REG_PC]);
     log_hex("GBA_CPSR=", reg[GPSP_REG_CPSR]);
+    log_text(video_frame_written ? "VIDEO_RAW_WRITE=PASS" : "VIDEO_RAW_WRITE=FAIL");
     ok = loaded && g_video_frames == HEADLESS_FRAMES &&
-        g_video_nonzero != 0u && g_audio_frames != 0u;
+        g_video_nonzero != 0u && g_audio_frames != 0u && video_frame_written;
     log_text(ok ? "RESULT=PASS" : "RESULT=FAIL");
     bda_msgbox("gpSP Headless", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

@@ -9,6 +9,7 @@
 #define BBK_AUDIO_OUTPUT_RATE 22050u
 #define BBK_AUDIO_BLOCK_SAMPLES 512u
 #define BBK_AUDIO_RING_SAMPLES 4096u
+#define BBK_AUDIO_VOLUME_MAX 4u
 
 typedef struct bbk_audio_output {
     s16 ring[BBK_AUDIO_RING_SAMPLES];
@@ -22,6 +23,8 @@ typedef struct bbk_audio_output {
     u32 blocks_written;
     u32 dropped_samples;
     u32 short_writes;
+    u32 volume_level;
+    u32 effective_attenuation;
     int original_attenuation;
     int muted;
     int opened;
@@ -29,7 +32,7 @@ typedef struct bbk_audio_output {
 
 void bbk_audio_output_init(bbk_audio_output_t *output);
 void bbk_audio_output_start(bbk_audio_output_t *output);
-void bbk_audio_output_set_muted(bbk_audio_output_t *output, int muted);
+void bbk_audio_output_set_level(bbk_audio_output_t *output, u32 volume_level);
 size_t bbk_audio_output_push_stereo(
     bbk_audio_output_t *output, const int16_t *samples, size_t frames
 );

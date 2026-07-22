@@ -32,6 +32,12 @@ jobs:
         shell: pwsh
         run: .\tools\build.ps1 -Target gpsp_app
 
+      - name: Validate GBA.bda
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = (Resolve-Path .\sdk).Path
+          python -m bda_packer.validate build/gpsp_app/GBA.bda
+
       - name: Verify public ROM fixtures
         shell: pwsh
         run: .\tools\verify_public_test_roms.ps1

@@ -19,10 +19,15 @@ enum gba_control_mask {
     GBA_CONTROL_SELECT = 1u << 9,
     GBA_CONTROL_SOUND = 1u << 10,
     GBA_CONTROL_HELP = 1u << 11,
-    GBA_CONTROL_ROM = 1u << 12
+    GBA_CONTROL_ROM = 1u << 12,
+    GBA_CONTROL_SPEED = 1u << 13,
+    GBA_CONTROL_KEYMAP = 1u << 14
 };
 
 u32 gba_controls_hit_test(s32 screen_x, s32 screen_y);
-void gba_controls_render(u16 *pixels, u32 pressed_mask, int sound_enabled);
+void gba_controls_render(
+    u16 *pixels, u32 pressed_mask, u32 audio_level, u32 frameskip_interval,
+    int key_swap
+);
 
 #endif

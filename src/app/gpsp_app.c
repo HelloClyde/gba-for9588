@@ -10,6 +10,8 @@
 #include "bda/detail/runtime.h"
 
 #include "platform/bbk9588/audio_output.h"
+#include "platform/bbk9588/frontend_config.h"
+#include "platform/bbk9588/perf_counter.h"
 #include "platform/bbk9588/save_store.h"
 #include "ui/gba_controls.h"
 
@@ -28,6 +30,8 @@ extern volatile unsigned bbk9588_page_load_count;
 extern volatile unsigned bbk9588_page_load_last;
 extern volatile unsigned bbk9588_page_io_stage;
 extern volatile unsigned bbk9588_page_host_safe_count;
+extern volatile uint64_t bbk9588_page_io_ticks;
+extern volatile u32 bbk9588_page_io_max_ticks;
 #endif
 
 #define SCREEN_WIDTH 240
@@ -35,14 +39,17 @@ extern volatile unsigned bbk9588_page_host_safe_count;
 #define GBA_WIDTH 240
 #define GBA_HEIGHT 160
 #define ESCAPE_HOLD_TICKS 32u
+#define SOUND_HOLD_TICKS 20u
 #define ESCAPE_RELEASE_MAX_TICKS 200u
 #define CLOSE_PUMP_LIMIT 128u
 #define AUDIO_BACKPRESSURE_MAX_TICKS 4u
 #define RAW_EVENT_MAX_PER_POLL 8u
 #if defined(BBK_GPSP_CPU_TEST)
 #define DIAGNOSTIC_FRAME_INTERVAL 120u
+#elif defined(BBK_RUNTIME_LOG_INTERVAL_FRAMES)
+#define DIAGNOSTIC_FRAME_INTERVAL BBK_RUNTIME_LOG_INTERVAL_FRAMES
 #else
-#define DIAGNOSTIC_FRAME_INTERVAL 120u
+#define DIAGNOSTIC_FRAME_INTERVAL 600u
 #endif
 #define EXIT_CAUSE_NONE 0u
 #define EXIT_CAUSE_ESCAPE_HOLD 1u
@@ -57,6 +64,7 @@ static bda_gui_picture_t g_controls_picture;
 static u16 *g_controls_pixels;
 static bda_file_selector_t g_selector;
 static bbk_audio_output_t g_audio;
+static bbk_frontend_config_t g_config;
 static bbk_save_store_t g_save_store;
 static char g_rom_path[BBK_SAVE_PATH_CAPACITY];
 static char g_log_path[BBK_SAVE_PATH_CAPACITY];
@@ -67,6 +75,7 @@ static u32 g_input_mask;
 static u32 g_rendered_controls_mask;
 static u32 g_escape_start_tick;
 static u32 g_touch_start_tick;
+static u32 g_sound_touch_start_tick;
 static u32 g_escape_max_ticks;
 static u32 g_touch_start_max_ticks;
 static u32 g_exit_cause;
@@ -76,6 +85,8 @@ static int g_escape_down;
 static int g_touch_start_down;
 static int g_raw_touch_down;
 static int g_sound_touch_down;
+static int g_speed_touch_down;
+static int g_keymap_touch_down;
 static int g_help_touch_down;
 static int g_help_pending;
 static int g_modal_active;
@@ -83,8 +94,15 @@ static int g_rom_touch_down;
 static int g_rom_change_pending;
 static int g_controls_dirty;
 static int g_full_redraw;
-static int g_audio_enabled;
+static u32 g_audio_level;
+static u32 g_audio_restore_level;
 static int g_audio_toggle_pending;
+static int g_audio_level_cycle_pending;
+static u32 g_frameskip_interval;
+static int g_speed_cycle_pending;
+static int g_key_swap;
+static int g_keymap_toggle_pending;
+static int g_variable_update_pending;
 static int g_exit_requested;
 static int g_detached;
 static int g_core_loaded;
@@ -111,6 +129,13 @@ static u32 g_touch_position_reads;
 static u32 g_touch_hit_changes;
 static u32 g_exit_release_ticks;
 static u32 g_close_pump_calls;
+static bbk_perf_accumulator_t g_perf_core;
+static bbk_perf_accumulator_t g_perf_video;
+static bbk_perf_accumulator_t g_perf_audio;
+static bbk_perf_accumulator_t g_perf_pcm;
+static bbk_perf_accumulator_t g_perf_controls;
+static uint64_t g_perf_wall_ticks;
+static u32 g_perf_wall_last;
 static volatile u32 g_diag_loop_stage;
 static volatile u32 g_diag_loop_frame;
 
@@ -123,8 +148,14 @@ static const char g_help_body[] =
     "\315\313\263\366\274\374\263\244\260\264\243\272"
         "\315\313\263\366\304\243\304\342\306\367\n"
     "\264\245\306\301\243\272A/B/L/R/\277\252\312\274/\321\241\324\361\n"
-    "\321\357\311\371\306\367\260\264\305\245\243\272"
+    "\321\357\311\371\306\367\266\314\260\264\243\272"
         "\311\371\322\364\277\252\271\330\n"
+    "\321\357\311\371\306\367\263\244\260\264\243\272"
+        "\322\364\301\277100/75/50/25%\n"
+    "\326\241\302\312\260\264\305\245\243\27230/20/60"
+        "\326\241\307\320\273\273\n"
+    "AB\260\264\305\245\243\272\307\320\273\273\312\265\314\345"
+        "\310\267\310\317/\315\313\263\366\274\374\n"
     "\316\312\272\305\260\264\305\245\243\272"
         "\312\271\323\303\313\265\303\367\n"
     "\316\304\274\376\274\320\260\264\305\245\243\272"
@@ -155,6 +186,48 @@ static const char g_load_fatal_body[] =
     "\316\336\267\250\273\326\270\264\324\255\323\316\317\267\241\243";
 
 static void shutdown_core(void);
+
+static int diagnostic_frame_due(u32 frames)
+{
+    if (frames == 1u) {
+        return 1;
+    }
+#if DIAGNOSTIC_FRAME_INTERVAL == 0
+    return 0;
+#else
+    return frames % DIAGNOSTIC_FRAME_INTERVAL == 0u;
+#endif
+}
+
+static void perf_interval_reset(void)
+{
+    bbk_perf_accumulator_reset(&g_perf_core);
+    bbk_perf_accumulator_reset(&g_perf_video);
+    bbk_perf_accumulator_reset(&g_perf_audio);
+    bbk_perf_accumulator_reset(&g_perf_pcm);
+    bbk_perf_accumulator_reset(&g_perf_controls);
+    g_perf_wall_ticks = 0u;
+    g_perf_wall_last = bbk_perf_counter_read();
+#if defined(HAVE_DYNAREC)
+    bbk9588_page_io_ticks = 0u;
+    bbk9588_page_io_max_ticks = 0u;
+#endif
+}
+
+static void perf_wall_sample(void)
+{
+    u32 now = bbk_perf_counter_read();
+    g_perf_wall_ticks += bbk_perf_counter_elapsed(g_perf_wall_last, now);
+    g_perf_wall_last = now;
+}
+
+static u32 perf_permille(uint64_t ticks, uint64_t wall_ticks)
+{
+    if (wall_ticks == 0u) {
+        return 0u;
+    }
+    return (u32)((ticks * 1000u) / wall_ticks);
+}
 
 static int open_log(const char *mode)
 {
@@ -221,6 +294,8 @@ static const char *variable_value(const char *key)
 #if defined(BBK_GPSP_CPU_TEST)
         return "59";
 #else
+        if (g_frameskip_interval == 0u) return "0";
+        if (g_frameskip_interval == 2u) return "2";
         return "1";
 #endif
     }
@@ -259,7 +334,8 @@ static bool environment_callback(unsigned command, void *data)
             variable_value(((struct retro_variable *)data)->key);
         return ((struct retro_variable *)data)->value != 0;
     case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE:
-        *(bool *)data = false;
+        *(bool *)data = g_variable_update_pending != 0;
+        g_variable_update_pending = 0;
         return true;
     case RETRO_ENVIRONMENT_GET_INPUT_BITMASKS:
         return true;
@@ -305,6 +381,7 @@ static void video_callback(
 {
     void *old_object;
     int video_result;
+    u32 perf_start;
     if (!data || width != GBA_WIDTH || height != GBA_HEIGHT ||
         pitch < GBA_WIDTH * sizeof(u16)) {
         return;
@@ -314,6 +391,7 @@ static void video_callback(
         log_text("VIDEO_CB_BEGIN");
     }
     g_video_picture.source_pixels = data;
+    perf_start = bbk_perf_counter_read();
     (void)bda_gui_draw_guard_begin();
     old_object = bda_gui_select_draw_object(g_draw, g_draw_object);
     video_result = bda_gui_render_picture(
@@ -321,15 +399,14 @@ static void video_callback(
     );
     (void)bda_gui_select_draw_object(g_draw, old_object);
     (void)bda_gui_draw_guard_end();
+    bbk_perf_accumulator_add(
+        &g_perf_video, perf_start, bbk_perf_counter_read()
+    );
     if (g_video_callbacks == 1u) {
         log_value("VIDEO_CB_END=", (u32)video_result);
     }
     if (video_result == 0) {
         ++g_video_frames;
-        if (g_video_frames == 1u ||
-            g_video_frames % DIAGNOSTIC_FRAME_INTERVAL == 0u) {
-            log_value("FRAME_HEARTBEAT=", g_video_frames);
-        }
     } else {
         ++g_video_submit_errors;
     }
@@ -339,6 +416,7 @@ static void render_controls(void)
 {
     void *old_object;
     int result;
+    u32 perf_start;
     if (!g_controls_dirty || !g_controls_pixels || !g_draw || !g_draw_object) {
         return;
     }
@@ -350,11 +428,16 @@ static void render_controls(void)
         g_controls_pixels,
         g_input_mask |
             (g_sound_touch_down ? GBA_CONTROL_SOUND : 0u) |
+            (g_speed_touch_down ? GBA_CONTROL_SPEED : 0u) |
+            (g_keymap_touch_down ? GBA_CONTROL_KEYMAP : 0u) |
             (g_help_touch_down ? GBA_CONTROL_HELP : 0u) |
             (g_rom_touch_down ? GBA_CONTROL_ROM : 0u),
-        g_audio_enabled
+        g_audio_level,
+        g_frameskip_interval,
+        g_key_swap
     );
     g_controls_picture.source_pixels = g_controls_pixels;
+    perf_start = bbk_perf_counter_read();
     (void)bda_gui_draw_guard_begin();
     old_object = bda_gui_select_draw_object(g_draw, g_draw_object);
     result = bda_gui_render_picture(
@@ -364,6 +447,9 @@ static void render_controls(void)
     );
     (void)bda_gui_select_draw_object(g_draw, old_object);
     (void)bda_gui_draw_guard_end();
+    bbk_perf_accumulator_add(
+        &g_perf_controls, perf_start, bbk_perf_counter_read()
+    );
     if (g_controls_render_attempts == 1u) {
         log_value("CONTROLS_RENDER_END=", (u32)result);
     }
@@ -379,6 +465,7 @@ static void render_full_surface_if_needed(void)
 {
     void *old_object;
     int result;
+    u32 perf_start;
 
     if (!g_full_redraw || !g_draw || !g_draw_object) {
         return;
@@ -387,6 +474,7 @@ static void render_full_surface_if_needed(void)
         g_full_redraw = 0;
         return;
     }
+    perf_start = bbk_perf_counter_read();
     (void)bda_gui_draw_guard_begin();
     old_object = bda_gui_select_draw_object(g_draw, g_draw_object);
     result = bda_gui_render_picture(
@@ -394,6 +482,9 @@ static void render_full_surface_if_needed(void)
     );
     (void)bda_gui_select_draw_object(g_draw, old_object);
     (void)bda_gui_draw_guard_end();
+    bbk_perf_accumulator_add(
+        &g_perf_video, perf_start, bbk_perf_counter_read()
+    );
     if (result == 0) {
         g_full_redraw = 0;
     } else {
@@ -404,11 +495,16 @@ static void render_full_surface_if_needed(void)
 static size_t audio_callback(const int16_t *data, size_t frames)
 {
     size_t pushed;
+    u32 perf_start;
     ++g_audio_callbacks;
     if (g_audio_callbacks == 1u) {
         log_value("AUDIO_CB_BEGIN=", (u32)frames);
     }
+    perf_start = bbk_perf_counter_read();
     pushed = bbk_audio_output_push_stereo(&g_audio, data, frames);
+    bbk_perf_accumulator_add(
+        &g_perf_audio, perf_start, bbk_perf_counter_read()
+    );
     if (g_audio_callbacks == 1u) {
         log_value("AUDIO_CB_END=", (u32)pushed);
     }
@@ -419,6 +515,8 @@ static u32 touch_visual_mask(void)
 {
     return g_touch_mask |
         (g_sound_touch_down ? GBA_CONTROL_SOUND : 0u) |
+        (g_speed_touch_down ? GBA_CONTROL_SPEED : 0u) |
+        (g_keymap_touch_down ? GBA_CONTROL_KEYMAP : 0u) |
         (g_help_touch_down ? GBA_CONTROL_HELP : 0u) |
         (g_rom_touch_down ? GBA_CONTROL_ROM : 0u);
 }
@@ -430,6 +528,8 @@ static void clear_touch_state(void)
     g_raw_touch_down = 0;
     g_touch_mask = 0u;
     g_sound_touch_down = 0;
+    g_speed_touch_down = 0;
+    g_keymap_touch_down = 0;
     g_help_touch_down = 0;
     g_rom_touch_down = 0;
     if (previous_visual_mask != 0u) {
@@ -443,15 +543,39 @@ static void apply_touch_hit(u32 hit)
     u32 previous_visual_mask = touch_visual_mask();
 
     if ((hit & GBA_CONTROL_SOUND) != 0u) {
+        g_speed_touch_down = 0;
+        g_keymap_touch_down = 0;
         g_help_touch_down = 0;
         g_rom_touch_down = 0;
         if (!g_sound_touch_down) {
             g_sound_touch_down = 1;
-            g_audio_toggle_pending = 1;
+            g_sound_touch_start_tick = bda_gui_tick_count_25ms();
+        }
+        g_touch_mask = 0u;
+    } else if ((hit & GBA_CONTROL_SPEED) != 0u) {
+        g_sound_touch_down = 0;
+        g_keymap_touch_down = 0;
+        g_help_touch_down = 0;
+        g_rom_touch_down = 0;
+        if (!g_speed_touch_down) {
+            g_speed_touch_down = 1;
+            g_speed_cycle_pending = 1;
+        }
+        g_touch_mask = 0u;
+    } else if ((hit & GBA_CONTROL_KEYMAP) != 0u) {
+        g_sound_touch_down = 0;
+        g_speed_touch_down = 0;
+        g_help_touch_down = 0;
+        g_rom_touch_down = 0;
+        if (!g_keymap_touch_down) {
+            g_keymap_touch_down = 1;
+            g_keymap_toggle_pending = 1;
         }
         g_touch_mask = 0u;
     } else if ((hit & GBA_CONTROL_HELP) != 0u) {
         g_sound_touch_down = 0;
+        g_speed_touch_down = 0;
+        g_keymap_touch_down = 0;
         g_rom_touch_down = 0;
         if (!g_help_touch_down) {
             g_help_touch_down = 1;
@@ -460,6 +584,8 @@ static void apply_touch_hit(u32 hit)
         g_touch_mask = 0u;
     } else if ((hit & GBA_CONTROL_ROM) != 0u) {
         g_sound_touch_down = 0;
+        g_speed_touch_down = 0;
+        g_keymap_touch_down = 0;
         g_help_touch_down = 0;
         if (!g_rom_touch_down) {
             g_rom_touch_down = 1;
@@ -468,6 +594,8 @@ static void apply_touch_hit(u32 hit)
         g_touch_mask = 0u;
     } else {
         g_sound_touch_down = 0;
+        g_speed_touch_down = 0;
+        g_keymap_touch_down = 0;
         g_help_touch_down = 0;
         g_rom_touch_down = 0;
         g_touch_mask = hit;
@@ -483,6 +611,23 @@ static void update_touch_position(void)
     ++g_touch_position_reads;
     bda_gui_touch_position(&g_touch_x, &g_touch_y);
     apply_touch_hit(gba_controls_hit_test((s32)g_touch_x, (s32)g_touch_y));
+}
+
+static void finish_sound_touch(void)
+{
+    u32 elapsed;
+
+    if (!g_sound_touch_down) {
+        return;
+    }
+    elapsed = bda_gui_tick_elapsed_25ms(
+        g_sound_touch_start_tick, bda_gui_tick_count_25ms()
+    );
+    if (elapsed >= SOUND_HOLD_TICKS) {
+        g_audio_level_cycle_pending = 1;
+    } else {
+        g_audio_toggle_pending = 1;
+    }
 }
 
 static void poll_raw_touch_events(void)
@@ -516,6 +661,7 @@ static void poll_raw_touch_events(void)
             case BDA_INPUT_EVENT_TOUCH_UP:
                 ++g_raw_touch_up_count;
                 if (g_raw_touch_down) {
+                    finish_sound_touch();
                     clear_touch_state();
                     move_pending = 0;
                 } else {
@@ -549,8 +695,10 @@ static u32 physical_input_mask(void)
     if (bda_gui_input_packet_key_pressed(&packet, BDA_KEY_DOWN)) mask |= GBA_CONTROL_DOWN;
     if (bda_gui_input_packet_key_pressed(&packet, BDA_KEY_LEFT)) mask |= GBA_CONTROL_LEFT;
     if (bda_gui_input_packet_key_pressed(&packet, BDA_KEY_RIGHT)) mask |= GBA_CONTROL_RIGHT;
-    if (bda_gui_input_packet_key_pressed(&packet, BDA_KEY_ENTER)) mask |= GBA_CONTROL_A;
-    escape = g_touch_mask == 0u &&
+    if (bda_gui_input_packet_key_pressed(&packet, BDA_KEY_ENTER)) {
+        mask |= g_key_swap ? GBA_CONTROL_B : GBA_CONTROL_A;
+    }
+    escape = !g_raw_touch_down &&
         bda_gui_input_packet_key_pressed(&packet, BDA_KEY_ESCAPE);
     now = bda_gui_tick_count_25ms();
     if (escape) {
@@ -567,7 +715,7 @@ static u32 physical_input_mask(void)
             g_exit_cause = EXIT_CAUSE_ESCAPE_HOLD;
             g_exit_requested = 1;
         } else {
-            mask |= GBA_CONTROL_B;
+            mask |= g_key_swap ? GBA_CONTROL_A : GBA_CONTROL_B;
         }
     } else {
         g_escape_down = 0;
@@ -739,6 +887,7 @@ static void reset_progress_baseline(void)
     g_progress_last_core_frames = g_core_frames;
     g_progress_last_video_frames = g_video_frames;
     g_progress_last_audio_samples = audio_samples;
+    perf_interval_reset();
 }
 
 static void service_help_page(void)
@@ -778,7 +927,7 @@ static void service_help_page(void)
     }
     if (audio_was_open) {
         bbk_audio_output_start(&g_audio);
-        bbk_audio_output_set_muted(&g_audio, !g_audio_enabled);
+        bbk_audio_output_set_level(&g_audio, g_audio_level);
         log_text("HELP_PAGE_AUDIO_RESTART=PASS");
     }
 
@@ -879,7 +1028,7 @@ static void service_rom_change(void)
     }
     if (audio_was_open) {
         bbk_audio_output_start(&g_audio);
-        bbk_audio_output_set_muted(&g_audio, !g_audio_enabled);
+        bbk_audio_output_set_level(&g_audio, g_audio_level);
         log_text("ROM_CHANGE_AUDIO_RESTART=PASS");
     }
     reset_progress_baseline();
@@ -900,9 +1049,9 @@ static int initialize_window(bda_frame_desc_t *descriptor)
     g_controls_picture.height = GBA_CONTROLS_HEIGHT;
     g_controls_picture.selected_index = -1;
 #if defined(BBK_GPSP_CPU_TEST)
-    descriptor->title = "GBA ROM IO TEST R39";
+    descriptor->title = "GBA SAVE BUS TEST R40";
 #else
-    descriptor->title = "GBA ROM IO R39";
+    descriptor->title = "GBA PERF R44";
 #endif
     descriptor->wndproc = app_window_proc;
     descriptor->height = SCREEN_WIDTH;
@@ -952,21 +1101,73 @@ static void service_audio_with_backpressure(void)
     }
 }
 
-static void apply_audio_toggle(void)
+static void apply_audio_controls(void)
 {
-    if (!g_audio_toggle_pending) {
+    u32 next_level;
+
+    if (!g_audio_toggle_pending && !g_audio_level_cycle_pending) {
         return;
     }
+    if (g_audio_level_cycle_pending) {
+        next_level = g_audio_level != 0u ?
+            g_audio_level : g_audio_restore_level;
+        next_level = next_level <= 1u ? BBK_AUDIO_VOLUME_MAX :
+            next_level - 1u;
+        g_audio_restore_level = next_level;
+        g_audio_level = next_level;
+        log_value("AUDIO_LEVEL_SWITCH=", next_level);
+    } else if (g_audio_level != 0u) {
+        g_audio_restore_level = g_audio_level;
+        g_audio_level = 0u;
+        log_text("AUDIO_SWITCH=OFF");
+    } else {
+        g_audio_level = g_audio_restore_level;
+        log_text("AUDIO_SWITCH=ON");
+    }
     g_audio_toggle_pending = 0;
-    g_audio_enabled = !g_audio_enabled;
-    bbk_audio_output_set_muted(&g_audio, !g_audio_enabled);
-    log_text(g_audio_enabled ? "AUDIO_SWITCH=ON" : "AUDIO_SWITCH=OFF");
+    g_audio_level_cycle_pending = 0;
+    bbk_frontend_config_set_audio_level(&g_config, g_audio_level);
+    bbk_audio_output_set_level(&g_audio, g_audio_level);
+    log_value("AUDIO_ATTENUATION=", g_audio.effective_attenuation);
+    g_controls_dirty = 1;
+}
+
+static void apply_speed_cycle(void)
+{
+    if (!g_speed_cycle_pending) {
+        return;
+    }
+    g_speed_cycle_pending = 0;
+#if defined(BBK_GPSP_CPU_TEST)
+    return;
+#else
+    u32 next_interval;
+
+    next_interval = g_frameskip_interval == 1u ? 2u :
+        (g_frameskip_interval == 2u ? 0u : 1u);
+    g_frameskip_interval = next_interval;
+    bbk_frontend_config_set_frameskip(&g_config, next_interval);
+    g_variable_update_pending = 1;
+    log_value("FRAMESKIP_SWITCH=", next_interval);
+    g_controls_dirty = 1;
+#endif
+}
+
+static void apply_keymap_toggle(void)
+{
+    if (!g_keymap_toggle_pending) {
+        return;
+    }
+    g_keymap_toggle_pending = 0;
+    g_key_swap = !g_key_swap;
+    bbk_frontend_config_set_key_swap(&g_config, g_key_swap);
+    log_text(g_key_swap ? "KEYMAP_SWITCH=BA" : "KEYMAP_SWITCH=AB");
     g_controls_dirty = 1;
 }
 
 static void log_runtime_progress(void)
 {
-    char line[640];
+    char line[1280];
     u32 now = bda_gui_tick_count_25ms();
     u32 elapsed_ticks = bda_gui_tick_elapsed_25ms(g_progress_last_tick, now);
     u32 core_delta = g_core_frames - g_progress_last_core_frames;
@@ -978,6 +1179,11 @@ static void log_runtime_progress(void)
     u32 emu_fps100 = elapsed_ticks != 0u ? core_delta * 4000u / elapsed_ticks : 0u;
     u32 video_fps100 = elapsed_ticks != 0u ? video_delta * 4000u / elapsed_ticks : 0u;
     u32 audio_hz = elapsed_ticks != 0u ? audio_delta * 40u / elapsed_ticks : 0u;
+    uint64_t perf_rom_ticks;
+    uint64_t perf_nested_ticks;
+    uint64_t perf_cpu_ticks;
+    u32 perf_count_per_25ms;
+    u32 perf_rom_max;
 #if defined(HAVE_DYNAREC)
     u32 jit_rom;
     u32 jit_ram;
@@ -988,6 +1194,9 @@ static void log_runtime_progress(void)
     u32 rom_page_last = bbk9588_page_load_last;
     u32 rom_page_stage = bbk9588_page_io_stage;
     u32 rom_page_safe = bbk9588_page_host_safe_count;
+
+    perf_rom_ticks = bbk9588_page_io_ticks;
+    perf_rom_max = bbk9588_page_io_max_ticks;
 
     bbk9588_drc_get_stats(
         &jit_rom, &jit_ram, &jit_rom_flushes, &jit_ram_flushes,
@@ -1003,14 +1212,25 @@ static void log_runtime_progress(void)
     u32 rom_page_last = 0u;
     u32 rom_page_stage = 0u;
     u32 rom_page_safe = 0u;
+    perf_rom_ticks = 0u;
+    perf_rom_max = 0u;
 #endif
+
+    perf_nested_ticks = g_perf_video.ticks + g_perf_audio.ticks +
+        perf_rom_ticks;
+    perf_cpu_ticks = g_perf_core.ticks > perf_nested_ticks ?
+        g_perf_core.ticks - perf_nested_ticks : 0u;
+    perf_count_per_25ms = elapsed_ticks != 0u ?
+        (u32)(g_perf_wall_ticks / elapsed_ticks) : 0u;
 
     if (snprintf(
             line, sizeof(line),
-            "RUN core=%u emu_fps100=%u video_fps100=%u video_cb=%u video_ok=%u video_err=%u sound=%u audio=%u short=%u drop=%u queue=%u aud_hz=%u bp=%u raw_poll=%u raw_evt=%u raw_max=%u raw_cap=%u raw_ignored=%u touch_down=%u touch_move=%u touch_up=%u touch_pos=%u hit_change=%u ctrl_draw=%u jit_rom=%u jit_ram=%u jit_rf=%u jit_wf=%u jit_pf=%u rom_pg=%u rom_last=%u rom_stage=%u rom_safe=%u",
+            "RUN core=%u emu_fps100=%u video_fps100=%u video_cb=%u video_ok=%u video_err=%u sound=%u vol=%u att=%u skip=%u audio=%u short=%u drop=%u queue=%u aud_hz=%u bp=%u raw_poll=%u raw_evt=%u raw_max=%u raw_cap=%u raw_ignored=%u touch_down=%u touch_move=%u touch_up=%u touch_pos=%u hit_change=%u ctrl_draw=%u jit_rom=%u jit_ram=%u jit_rf=%u jit_wf=%u jit_pf=%u rom_pg=%u rom_last=%u rom_stage=%u rom_safe=%u perf_wall=%llu perf_c25=%u perf_run_pm=%u perf_cpu_pm=%u perf_video_pm=%u perf_audio_pm=%u perf_pcm_pm=%u perf_rom_pm=%u perf_ctrl_pm=%u perf_vmax=%u perf_amax=%u perf_rmax=%u",
             g_core_frames, emu_fps100, video_fps100,
             g_video_callbacks, g_video_frames,
-            g_video_submit_errors, (u32)g_audio_enabled, g_audio.blocks_written,
+            g_video_submit_errors, g_audio_level != 0u,
+            g_audio_level, g_audio.effective_attenuation,
+            g_frameskip_interval, g_audio.blocks_written,
             g_audio.short_writes, g_audio.dropped_samples, g_audio.queued_samples,
             audio_hz, g_audio_backpressure_skips,
             g_raw_poll_calls, g_raw_event_count, g_raw_event_max_batch,
@@ -1020,14 +1240,24 @@ static void log_runtime_progress(void)
             g_touch_hit_changes, g_controls_render_attempts,
             jit_rom, jit_ram, jit_rom_flushes, jit_ram_flushes,
             jit_proactive_flushes, rom_page_loads, rom_page_last,
-            rom_page_stage, rom_page_safe
+            rom_page_stage, rom_page_safe,
+            (unsigned long long)g_perf_wall_ticks, perf_count_per_25ms,
+            perf_permille(g_perf_core.ticks, g_perf_wall_ticks),
+            perf_permille(perf_cpu_ticks, g_perf_wall_ticks),
+            perf_permille(g_perf_video.ticks, g_perf_wall_ticks),
+            perf_permille(g_perf_audio.ticks, g_perf_wall_ticks),
+            perf_permille(g_perf_pcm.ticks, g_perf_wall_ticks),
+            perf_permille(perf_rom_ticks, g_perf_wall_ticks),
+            perf_permille(g_perf_controls.ticks, g_perf_wall_ticks),
+            g_perf_video.max_ticks, g_perf_audio.max_ticks, perf_rom_max
         ) > 0) {
         log_text(line);
     }
-    g_progress_last_tick = now;
+    g_progress_last_tick = bda_gui_tick_count_25ms();
     g_progress_last_core_frames = g_core_frames;
     g_progress_last_video_frames = g_video_frames;
     g_progress_last_audio_samples = audio_samples;
+    perf_interval_reset();
 }
 
 static int wait_escape_release(void)
@@ -1117,12 +1347,15 @@ int bda_main(void)
     bda_gui_message_t message;
     void *save_data;
     int file;
+    int config_load_result;
+    int config_save_result;
     int select_result;
     int result = 0;
 
     g_log_path[0] = 0;
     memset(&message, 0, sizeof(message));
     memset(&g_audio, 0, sizeof(g_audio));
+    bbk_frontend_config_defaults(&g_config);
     memset(&g_save_store, 0, sizeof(g_save_store));
     g_frame = 0;
     g_draw = 0;
@@ -1136,11 +1369,14 @@ int bda_main(void)
     g_rendered_controls_mask = ~0u;
     g_escape_max_ticks = 0u;
     g_touch_start_max_ticks = 0u;
+    g_sound_touch_start_tick = 0u;
     g_exit_cause = EXIT_CAUSE_NONE;
     g_escape_down = 0;
     g_touch_start_down = 0;
     g_raw_touch_down = 0;
     g_sound_touch_down = 0;
+    g_speed_touch_down = 0;
+    g_keymap_touch_down = 0;
     g_help_touch_down = 0;
     g_help_pending = 0;
     g_modal_active = 0;
@@ -1148,8 +1384,15 @@ int bda_main(void)
     g_rom_change_pending = 0;
     g_controls_dirty = 1;
     g_full_redraw = 0;
-    g_audio_enabled = 1;
+    g_audio_level = BBK_AUDIO_VOLUME_MAX;
+    g_audio_restore_level = BBK_AUDIO_VOLUME_MAX;
     g_audio_toggle_pending = 0;
+    g_audio_level_cycle_pending = 0;
+    g_frameskip_interval = 1u;
+    g_speed_cycle_pending = 0;
+    g_key_swap = 0;
+    g_keymap_toggle_pending = 0;
+    g_variable_update_pending = 0;
     g_exit_requested = 0;
     g_detached = 0;
     g_core_loaded = 0;
@@ -1190,16 +1433,22 @@ int bda_main(void)
         bda_msgbox("GBA Emulator", "ROM selection failed");
         return 1;
     }
+    config_load_result = bbk_frontend_config_load(&g_config);
+    g_audio_level = g_config.audio_level;
+    g_audio_restore_level = g_audio_level != 0u ?
+        g_audio_level : BBK_AUDIO_VOLUME_MAX;
+    g_frameskip_interval = g_config.frameskip_interval;
+    g_key_swap = g_config.key_swap != 0u;
     file = open_log("wb");
     if (bda_fs_file_is_valid(file)) {
         (void)bda_fs_close_raw(file);
     }
 #if defined(BBK_GPSP_CPU_TEST)
-    log_text("BBK9588 GBA ROM IO TEST R39");
-    log_text("BUILD_ID=DRC_R1_ROM_PAGE_HOST_IO_TEST_R39");
+    log_text("BBK9588 GBA SAVE BUS TEST R40");
+    log_text("BUILD_ID=DRC_R1_ROM_PAGE_SAVE_BUS_TEST_R40");
 #else
-    log_text("BBK9588 GBA ROM IO R39");
-    log_text("BUILD_ID=DRC_R1_30FPS_ROM_PAGE_HOST_IO_R39");
+    log_text("BBK9588 GBA PERF R44");
+    log_text("BUILD_ID=DRC_R1_CP0_PHASE_PROFILE_R44");
     log_text("HOST_IRQ_WINDOW=UPDATE_GBA_AND_ROM_PAGE_IO_FULL_CONTEXT");
     log_text("HOST_IRQ_CONTEXT=GP_S0_S7_FP_RA");
     log_text("HOST_POLL_CONTEXT=LIBRETRO_FRAME_BOUNDARY");
@@ -1210,6 +1459,10 @@ int bda_main(void)
     log_text("HELP_PAGE=SDK_PARENT0_RELEASE_REACQUIRE");
     log_text("HELP_LANGUAGE=GBK_CHINESE");
     log_text("ROM_SWITCH=CONFIRM_SAVE_RELOAD");
+    log_text("FRAMESKIP_CONTROL=TOUCH_30_20_60");
+    log_text("AUDIO_CONTROL=SHORT_MUTE_LONG_LEVEL_500MS");
+    log_text("KEYMAP_CONTROL=TOUCH_AB_BA");
+    log_text("CONFIG_STORE=CRC_AB_EXIT_ONLY");
     log_text("INPUT_ARCH=RAW_EVENT_FRAME_BOUNDARY");
     log_text("INPUT_POLL_INTERVAL_FRAMES=1");
     log_value("RAW_EVENT_MAX_PER_POLL=", RAW_EVENT_MAX_PER_POLL);
@@ -1225,9 +1478,13 @@ int bda_main(void)
     log_text("RAW_EVENT_VALUE=IGNORED");
     log_text("STARTUP_MOVE_UP=IGNORED_UNTIL_DOWN");
     log_text("TOUCH_START_EXIT=DISABLED");
-    log_text("RUNTIME_LOG_INTERVAL_FRAMES=120");
+    log_value("RUNTIME_LOG_INTERVAL_FRAMES=", DIAGNOSTIC_FRAME_INTERVAL);
+    log_text("PERF_COUNTER=CP0_COUNT_READ_ONLY");
+    log_text("PERF_SCOPE=ACTIVE_INTERVAL_RESET_AFTER_LOG");
+    log_text("PERF_UNIT=PERMILLE_OF_ACTIVE_WALL");
     log_text("JIT_MAINTENANCE=FRAME_BOUNDARY_BOTH_CACHES");
     log_text("JIT_PROACTIVE_THRESHOLD_PERCENT=75");
+    log_value("ROM_CACHE_BYTES=", (u32)ROM_BUFFER_SIZE * 1024u * 1024u);
     log_value("JIT_ROM_CAPACITY=", 2u * 1024u * 1024u);
     log_value("JIT_RAM_CAPACITY=", 384u * 1024u);
     log_text("PERIODIC_SAVE=DISABLED_EXIT_ONLY");
@@ -1238,6 +1495,10 @@ int bda_main(void)
     log_value("DIAG_LOOP_FRAME_ADDR=", (u32)&g_diag_loop_frame);
     log_value("DIAG_CORE_STAGE_ADDR=", (u32)&bbk9588_run_stage);
 #endif
+    log_value("CONFIG_LOAD_RESULT=", (u32)config_load_result);
+    log_value("CONFIG_GENERATION=", g_config.generation);
+    log_value("AUDIO_LEVEL_INITIAL=", g_audio_level);
+    log_text(g_key_swap ? "KEYMAP_INITIAL=BA" : "KEYMAP_INITIAL=AB");
 #if defined(HAVE_DYNAREC)
     log_text("CORE_MODE=DRC");
 #else
@@ -1248,8 +1509,16 @@ int bda_main(void)
     log_text("VIDEO_TARGET_FPS=1");
     log_text("FRAMESKIP_INTERVAL=59");
 #else
-    log_text("VIDEO_TARGET_FPS=30");
-    log_text("FRAMESKIP_INTERVAL=1");
+    if (g_frameskip_interval == 0u) {
+        log_text("VIDEO_TARGET_FPS=60");
+        log_text("FRAMESKIP_INTERVAL=0");
+    } else if (g_frameskip_interval == 2u) {
+        log_text("VIDEO_TARGET_FPS=20");
+        log_text("FRAMESKIP_INTERVAL=2");
+    } else {
+        log_text("VIDEO_TARGET_FPS=30");
+        log_text("FRAMESKIP_INTERVAL=1");
+    }
 #endif
     log_text("ROM_SELECT=PASS");
     log_value("ROM_PATH_LEN=", (u32)strlen(g_rom_path));
@@ -1274,20 +1543,24 @@ int bda_main(void)
     log_text("WINDOW=PASS");
     log_text("AUDIO_INIT_BEGIN");
     bbk_audio_output_init(&g_audio);
-    bbk_audio_output_set_muted(&g_audio, 0);
+    bbk_audio_output_set_level(&g_audio, g_audio_level);
     log_text("AUDIO_INIT=PASS");
     log_text("AUDIO_START_BEGIN");
     bbk_audio_output_start(&g_audio);
     log_text("AUDIO_START=PASS");
-    log_text("AUDIO_DEFAULT=ON");
-    g_progress_last_tick = bda_gui_tick_count_25ms();
+    log_text(g_audio_level != 0u ? "AUDIO_INITIAL=ON" : "AUDIO_INITIAL=OFF");
+    log_value("AUDIO_ATTENUATION_INITIAL=", g_audio.effective_attenuation);
     log_text("LOOP_BEGIN");
+    g_progress_last_tick = bda_gui_tick_count_25ms();
+    perf_interval_reset();
 
     while (!g_exit_requested && !g_detached) {
         g_diag_loop_frame = g_core_frames + 1u;
         g_diag_loop_stage = 1u;
         g_diag_loop_stage = 2u;
-        apply_audio_toggle();
+        apply_audio_controls();
+        apply_speed_cycle();
+        apply_keymap_toggle();
         service_help_page();
         service_rom_change();
         if (g_exit_requested || g_detached || !g_core_loaded) {
@@ -1297,7 +1570,13 @@ int bda_main(void)
             log_value("FRAME_BEGIN=", g_core_frames + 1u);
         }
         g_diag_loop_stage = 3u;
-        retro_run();
+        {
+            u32 perf_start = bbk_perf_counter_read();
+            retro_run();
+            bbk_perf_accumulator_add(
+                &g_perf_core, perf_start, bbk_perf_counter_read()
+            );
+        }
         g_diag_loop_stage = 4u;
         ++g_core_frames;
         if (g_core_frames <= 2u) {
@@ -1307,10 +1586,16 @@ int bda_main(void)
         render_controls();
         g_diag_loop_stage = 5u;
         g_diag_loop_stage = 6u;
-        service_audio_with_backpressure();
+        {
+            u32 perf_start = bbk_perf_counter_read();
+            service_audio_with_backpressure();
+            bbk_perf_accumulator_add(
+                &g_perf_pcm, perf_start, bbk_perf_counter_read()
+            );
+        }
         g_diag_loop_stage = 7u;
-        if (g_core_frames == 1u ||
-            g_core_frames % DIAGNOSTIC_FRAME_INTERVAL == 0u) {
+        perf_wall_sample();
+        if (diagnostic_frame_due(g_core_frames)) {
             log_runtime_progress();
         }
         g_diag_loop_stage = 8u;
@@ -1341,6 +1626,12 @@ int bda_main(void)
             ++g_save_writes;
         }
     }
+    config_save_result = bbk_frontend_config_save(&g_config);
+    log_value("CONFIG_SAVE_RESULT=", (u32)config_save_result);
+    log_value("CONFIG_GENERATION_FINAL=", g_config.generation);
+    if (config_save_result < 0 && result == 0) {
+        result = 5;
+    }
     if (g_exit_cause == EXIT_CAUSE_ESCAPE_HOLD) {
         (void)wait_escape_release();
     }
@@ -1354,7 +1645,10 @@ int bda_main(void)
     log_value("AUDIO_DROPPED=", g_audio.dropped_samples);
     log_value("AUDIO_SHORT_WRITES=", g_audio.short_writes);
     log_value("AUDIO_BACKPRESSURE_SKIPS=", g_audio_backpressure_skips);
-    log_value("AUDIO_ENABLED=", (u32)g_audio_enabled);
+    log_value("AUDIO_ENABLED=", g_audio_level != 0u);
+    log_value("AUDIO_LEVEL_FINAL=", g_audio_level);
+    log_value("FRAMESKIP_INTERVAL_FINAL=", g_frameskip_interval);
+    log_value("KEYMAP_SWAP_FINAL=", (u32)g_key_swap);
     log_value("RAW_POLL_CALLS=", g_raw_poll_calls);
     log_value("RAW_EVENT_COUNT=", g_raw_event_count);
     log_value("RAW_EVENT_MAX_BATCH=", g_raw_event_max_batch);

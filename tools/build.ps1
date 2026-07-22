@@ -1,9 +1,14 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('m0_smoke', 'm1_runtime', 'm1_av', 'm6_save', 'gpsp_headless', 'gpsp_dynarec', 'gpsp_app_interpreter', 'gpsp_app', 'gpsp_app_cpu_test')]
+    [ValidateSet('m0_smoke', 'm1_runtime', 'm1_av', 'm6_save', 'gpsp_headless', 'gpsp_headless_patched', 'gpsp_dynarec', 'gpsp_app_interpreter', 'gpsp_app', 'gpsp_app_cpu_test')]
     [string]$Target = 'm0_smoke',
     [ValidateRange(0, 10000)]
     [int]$HeadlessFrames = 0,
+    [ValidateSet('Os', 'O2', 'O3')]
+    [string]$Optimization = 'Os',
+    [ValidateSet(0, 120, 600)]
+    [int]$RuntimeLogIntervalFrames = 600,
+    [switch]$Lto,
     [switch]$SkipBootstrap
 )
 
@@ -46,7 +51,24 @@ $gxx = Find-Tool 'g++'
 $objcopy = Find-Tool 'objcopy'
 $objdump = Find-Tool 'objdump'
 $python = (Get-Command python -ErrorAction Stop).Source
-$buildRoot = Join-Path $repoRoot "build\$Target"
+$variantParts = @()
+if ($Optimization -ne 'Os' -or $Lto) {
+    $variantParts += "$Optimization$(if ($Lto) { '-lto' } else { '' })"
+}
+if ($RuntimeLogIntervalFrames -ne 600) {
+    $logVariant = if ($RuntimeLogIntervalFrames -eq 0) {
+        'logoff'
+    } else {
+        "log$RuntimeLogIntervalFrames"
+    }
+    $variantParts += $logVariant
+}
+$variantSuffix = if ($variantParts.Count -eq 0) {
+    ''
+} else {
+    '-' + ($variantParts -join '-')
+}
+$buildRoot = Join-Path $repoRoot "build\$Target$variantSuffix"
 $objectRoot = Join-Path $buildRoot 'obj'
 New-Item -ItemType Directory -Force -Path $objectRoot | Out-Null
 
@@ -80,6 +102,7 @@ if ($Target -eq 'm0_smoke') {
     if ($Target -in @('gpsp_app_interpreter', 'gpsp_app', 'gpsp_app_cpu_test')) {
         $sources += @(
             'src\platform\bbk9588\audio_output.c',
+            'src\platform\bbk9588\frontend_config.c',
             'src\platform\bbk9588\save_store.c',
             'src\ui\gba_controls.c',
             'src\app\gpsp_app.c'
@@ -108,8 +131,8 @@ if ($Target -eq 'm0_smoke') {
         (Join-Path $gpspRoot 'libretro\libretro-common\compat\compat_strl.c')
     )
     if ($Target -in @(
-        'gpsp_dynarec', 'gpsp_app_interpreter', 'gpsp_app',
-        'gpsp_app_cpu_test'
+        'gpsp_headless_patched', 'gpsp_dynarec', 'gpsp_app_interpreter',
+        'gpsp_app', 'gpsp_app_cpu_test'
     )) {
         $patchedGpspRoot = Join-Path $buildRoot 'patched-gpsp'
         $patchedMipsRoot = Join-Path $patchedGpspRoot 'mips'
@@ -173,6 +196,8 @@ if ($Target -eq 'm0_smoke') {
             'GBA EVENT WAKE'
         } elseif ($Target -eq 'gpsp_app_interpreter') {
             'GBA Emulator INT'
+        } elseif ($Target -eq 'gpsp_headless_patched') {
+            'GBA HL PATCH'
         } else {
             'GBA gpSP DRC'
         }
@@ -187,20 +212,26 @@ if ($Target -eq 'm0_smoke') {
 }
 
 $warningFlags = @('-Wall', '-Wextra', '-Werror')
-if ($Target -in @('gpsp_headless', 'gpsp_dynarec', 'gpsp_app_interpreter', 'gpsp_app', 'gpsp_app_cpu_test')) {
+if ($Target -in @('gpsp_headless', 'gpsp_headless_patched', 'gpsp_dynarec', 'gpsp_app_interpreter', 'gpsp_app', 'gpsp_app_cpu_test')) {
     $warningFlags = @('-Wall', '-Wextra')
 }
 $common = @(
     '-EL', '-march=mips32', '-msoft-float', '-mno-abicalls', '-G0', '-fno-pic',
-    '-Os', '-ffreestanding', '-fno-builtin', '-ffunction-sections', '-fdata-sections'
+    "-$Optimization", '-ffreestanding', '-fno-builtin',
+    '-ffunction-sections', '-fdata-sections'
 ) + $warningFlags + @(
     '-I', (Join-Path $sdkRoot 'sdk\include'),
     '-I', (Join-Path $repoRoot 'src'),
     '-I', (Join-Path $repoRoot 'src\libc\include')
 )
-if ($Target -in @('gpsp_headless', 'gpsp_dynarec', 'gpsp_app_interpreter', 'gpsp_app', 'gpsp_app_cpu_test')) {
+if ($Lto) {
+    $common += '-flto'
+}
+if ($Target -in @('gpsp_headless', 'gpsp_headless_patched', 'gpsp_dynarec', 'gpsp_app_interpreter', 'gpsp_app', 'gpsp_app_cpu_test')) {
     $common += @(
-        '-DBBK9588', '-DROM_BUFFER_SIZE=2', '-DHAVE_NO_LANGEXTRA',
+        '-DBBK9588', '-DROM_BUFFER_SIZE=2',
+        "-DBBK_RUNTIME_LOG_INTERVAL_FRAMES=$RuntimeLogIntervalFrames",
+        '-DHAVE_NO_LANGEXTRA',
         '-I', $gpspRoot,
         '-I', (Join-Path $gpspRoot 'libretro'),
         '-I', (Join-Path $gpspRoot 'libretro\libretro-common\include')
@@ -215,7 +246,7 @@ if ($Target -in @('gpsp_dynarec', 'gpsp_app', 'gpsp_app_cpu_test')) {
 if ($Target -eq 'gpsp_app_cpu_test') {
     $common += '-DBBK_GPSP_CPU_TEST=1'
 }
-if ($Target -in @('gpsp_headless', 'gpsp_dynarec')) {
+if ($Target -in @('gpsp_headless', 'gpsp_headless_patched', 'gpsp_dynarec')) {
     $effectiveHeadlessFrames = if ($HeadlessFrames -gt 0) {
         $HeadlessFrames
     } elseif ($Target -eq 'gpsp_dynarec') {
@@ -247,15 +278,20 @@ foreach ($relativeSource in $sources) {
         $compiler = $gcc
         $language = @('-x', 'assembler-with-cpp')
     }
+    $sourceCommon = $common
+    if ($Lto -and [IO.Path]::GetFileName($source) -eq 'freestanding.c') {
+        # Keep libc primitives as concrete link symbols for LTO-generated calls.
+        $sourceCommon += @('-fno-lto', '-fno-tree-loop-distribute-patterns')
+    }
     if ([IO.Path]::GetFileName($source) -eq 'bios_data.S') {
         Push-Location $gpspRoot
         try {
-            Invoke-Checked $compiler @($common + $language + @('-c', $source, '-o', $object))
+            Invoke-Checked $compiler @($sourceCommon + $language + @('-c', $source, '-o', $object))
         } finally {
             Pop-Location
         }
     } else {
-        Invoke-Checked $compiler @($common + $language + @('-c', $source, '-o', $object))
+        Invoke-Checked $compiler @($sourceCommon + $language + @('-c', $source, '-o', $object))
     }
     $objects += $object
 }
@@ -267,11 +303,15 @@ $bdaName = if ($Target -eq 'gpsp_app') { "$formalGbaTitle.bda" } else { "$Target
 $bda = Join-Path $buildRoot $bdaName
 $linker = Join-Path $repoRoot 'linker\bda.ld'
 
-Invoke-Checked $gcc (@(
+$linkArguments = @(
     '-EL', '-march=mips32', '-msoft-float', '-mno-abicalls', '-G0', '-fno-pic',
     '-nostdlib', '-Wl,--build-id=none', '-Wl,--gc-sections',
     "-Wl,-T,$linker", "-Wl,-Map,$map", '-o', $elf
-) + $objects + @('-lgcc'))
+)
+if ($Lto) {
+    $linkArguments += '-flto'
+}
+Invoke-Checked $gcc ($linkArguments + $objects + @('-lgcc'))
 Invoke-Checked $objcopy @('-O', 'binary', $elf, $raw)
 Invoke-Checked $objdump @('-d', '-h', $elf) | Out-File -LiteralPath (Join-Path $buildRoot "$Target.dump.txt") -Encoding ascii
 $packArguments = @(
