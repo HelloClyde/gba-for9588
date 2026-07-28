@@ -346,6 +346,13 @@
   `FRAME_HEARTBEAT` 文件写入已删除。默认 `-Os` BDA 已通过 SDK validator，大小 853404 字节，
   SHA-256 `609db81b08af63cdcf7ecbdee667ad393c9479d37a1addfe7cac612fd26b4d5e`；
   2026-07-22 真机冒烟确认可正常运行，尚未覆盖 10/30 分钟长测、全部切换档位和配置迁移。
+- 当前工作树 R45 改用 SDK 正式 direct framebuffer API。启动时动态获取地址、stride 和方向，
+  不依赖固定固件地址；每个显示帧将顶部 GBA 画面与底部控制层组成 `240x320 RGB565` 后直接
+  提交，获取或提交失败才退回 picture 接口。9588 模拟器使用 16 MiB Emerald ROM 连续运行
+  6191 个逻辑帧，稳定区间平均 `59.77/29.88 FPS`，累计 3098 次 framebuffer present、0 次
+  present 错误，音频 short/drop/backpressure 均为 0，正常退出 `RESULT=PASS`。正式 `GBA.bda`
+  大小 855260 字节，SHA-256
+  `616637e85f818b86f27c1cf22c85a5aa7cd934e01fd76ea1088b3d686504436d`；真机稳定性仍待验证。
 - 私有 Emerald fixture 已完成新游戏、角色移动、设置时钟和游戏内保存。顶部为原生
   `240x160` 游戏画面，底部为 A/B/L/R/D-pad/Start/Select 触摸控制层；实体方向键也已在
   游戏内验证，不再穿透到 9588 桌面。
@@ -510,15 +517,18 @@ JZ4740 只按 MIPS32 R1 构建，中断保护不得使用 R2 的 `di/ei/ehb`。�
 
 ### M3：视频输出
 
-- [x] gpSP RGB565 framebuffer 直接提交，不做中间 RGB888 转换。
+- [x] 通过 SDK 正式 API 动态获取 framebuffer，直接提交 RGB565，不使用固定地址，也不做
+  中间 RGB888 转换；获取或提交失败时保留 picture 接口回退。
 - [x] 默认布局：顶部 `240x160` 为 GBA 画面，底部 `240x160` 为触摸控制区。
-- [x] 优先使用 raw picture 原生尺寸提交；不稳定时使用一次 VX draw + 一次 guarded copy。
-- [ ] 控制区已只在按键、声音或帧率状态变化时重新绘制，R41 删除了背景覆盖前对 76.8 KiB
-  像素缓冲区的冗余 `memset`；每次变化仍提交整个 `240x160` 控制半屏，尚未缩小到单按键
-  dirty rect。
+- [x] 根据 SDK 返回的方向执行原生或 180 度提交；R45 模拟器已检查顶部画面、底部控制层和
+  退出后桌面方向正确，3098 次 framebuffer present 无错误。
+- [x] 控制区只在按键、声音或帧率状态变化时重新生成，R41 删除了背景覆盖前对 76.8 KiB
+  像素缓冲区的冗余 `memset`。
+- [ ] 当前正式 framebuffer API 每次 present 仍提交完整 `240x320`；尚未提供单按键 dirty
+  rect 或局部 present。
 - [ ] 真机默认 frameskip `1`：GBA 逻辑维持约 `59.7275 Hz`，每两帧渲染一帧，目标画面
-  约 30 fps；R41 已实现触摸 `0/1/2` 运行期切换和动态 libretro 变量更新，跳帧时仍运行
-  CPU、音频和输入，尚待模拟器和真机验证三档显示频率。
+  约 30 fps；R41 已实现触摸 `0/1/2` 运行期切换和动态 libretro 变量更新，R45 模拟器已验证
+  默认档稳定在 `29.85-29.92 FPS`，三档显示频率和 direct framebuffer 路径仍待真机验证。
 - [x] 验证 frame stop/release、compatible context free、end draw、close frame 的严格顺序。
 
 退出条件：颜色、行距和画面方向正确；运行 10 分钟无 draw slot 泄漏、花屏或残影。
@@ -589,7 +599,9 @@ JZ4740 只按 MIPS32 R1 构建，中断保护不得使用 R2 的 `di/ei/ehb`。�
 - [x] R44 只读 CP0 Count，分别统计 CPU emulation 近似独占时间、ROM page I/O、video present、
   audio resample、PCM service 和 controls present；记录区间千分比及单次最大耗时，日志关闭时
   在正常退出汇总全程，不引入 firmware timer 或新的 IRQ 窗口。
-- [ ] 优先减少文件换页和整屏提交，再优化热点 C 代码；不先写大范围平台汇编。
+- [ ] R45 已移除每帧 picture 接口提交；当前 direct framebuffer 完整提交在模拟器稳态占
+  `perf_video_pm=17-20`，暂不是首要热点。若真机剖析占比明显更高，再扩展 SDK 局部 present，
+  不先写大范围平台汇编。
 - [x] 构建脚本支持 `-Optimization Os/O2/O3` 与可选 `-Lto`，非默认变体写入独立目录；
   section GC 始终开启，不使用 `-ffast-math`。`-O2` 与 `-O3+LTO` 均已完成链接和 BDA 静态
   校验；LTO 构建对 freestanding libc 单独关闭 LTO，保留 `memcpy/memset` 的具体链接符号。
@@ -650,12 +662,12 @@ MVP 完成必须同时满足：
 
 ## 8. 下一轮开发顺序
 
-1. 根据 R44 阶段字段确定优化顺序；ROM cache 固定 2 MiB，不切换默认优化级别，
-   也不把 CP0 Count 接入 pacing。若控制层提交占比明显且 SDK 路径能实际缩小传输区域，再实现
-   单按键 dirty rect；否则保留当前状态变化时整块提交，避免增加 staging copy。
+1. 用 R45 direct framebuffer 正式 BDA 回填真机阶段字段并确定优化顺序；ROM cache 固定
+   2 MiB，不切换默认优化级别，也不把 CP0 Count 接入 pacing。若整屏 present 在真机占比明显，
+   再扩展 SDK 局部 present；否则保留当前完整表面提交，避免增加复杂的旋转 dirty rect。
 2. 补公开 RTC/日历 API 后接入真实时间；接口未公开前继续使用当前单调运行时间，不调用固定地址。
 3. 完成配置格式、性能日志字段和兼容矩阵文档，保持 v1/v2 配置读取兼容。
-4. 用当前 R44 正式 BDA 真机复测 SRAM/Flash 游戏，再连续运行 10 分钟和 30 分钟，逐个测试
+4. 用当前 R45 正式 BDA 真机复测 SRAM/Flash 游戏，再连续运行 10 分钟和 30 分钟，逐个测试
    方向、A/B/L/R、Start/Select、声音、帮助和换 ROM；日志应显示
    `INPUT_ARCH=RAW_EVENT_FRAME_BOUNDARY`、
    `WINDOW_EVENT_PUMP=DISABLED`，

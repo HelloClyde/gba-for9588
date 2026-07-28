@@ -59,8 +59,10 @@ static bda_handle_t g_frame;
 static bda_handle_t g_draw;
 static bda_handle_t g_draw_owner;
 static void *g_draw_object;
+static bda_gui_framebuffer_t g_framebuffer;
 static bda_gui_picture_t g_video_picture;
 static bda_gui_picture_t g_controls_picture;
+static u16 *g_surface_pixels;
 static u16 *g_controls_pixels;
 static bda_file_selector_t g_selector;
 static bbk_audio_output_t g_audio;
@@ -106,9 +108,13 @@ static int g_variable_update_pending;
 static int g_exit_requested;
 static int g_detached;
 static int g_core_loaded;
+static int g_framebuffer_enabled;
 static u32 g_core_frames;
 static u32 g_video_callbacks;
 static u32 g_video_submit_errors;
+static u32 g_framebuffer_acquire_attempts;
+static u32 g_framebuffer_presents;
+static u32 g_framebuffer_present_errors;
 static u32 g_controls_submit_errors;
 static u32 g_audio_backpressure_skips;
 static u32 g_controls_render_attempts;
@@ -375,30 +381,92 @@ static int acquire_draw_context(bda_handle_t owner)
     return 1;
 }
 
+static int acquire_direct_framebuffer(void)
+{
+    ++g_framebuffer_acquire_attempts;
+    memset(&g_framebuffer, 0, sizeof(g_framebuffer));
+    if (bda_gui_framebuffer_acquire(&g_framebuffer) != 0) {
+        g_framebuffer_enabled = 0;
+        return 0;
+    }
+    g_framebuffer_enabled = 1;
+    return 1;
+}
+
+static int present_direct_surface(void)
+{
+    int result;
+
+    if (!g_framebuffer_enabled || !g_surface_pixels) {
+        return -1;
+    }
+    result = bda_gui_framebuffer_present_rgb565(
+        &g_framebuffer, g_surface_pixels
+    );
+    if (result == 0) {
+        ++g_framebuffer_presents;
+        return 0;
+    }
+    ++g_framebuffer_present_errors;
+    g_framebuffer_enabled = 0;
+    log_text("FRAMEBUFFER_PRESENT=ERROR_FALLBACK");
+    return result;
+}
+
+static int render_video_with_firmware(void)
+{
+    void *old_object;
+    int result;
+
+    if (!g_draw || !g_draw_object || !g_video_picture.source_pixels) {
+        return -1;
+    }
+    (void)bda_gui_draw_guard_begin();
+    old_object = bda_gui_select_draw_object(g_draw, g_draw_object);
+    result = bda_gui_render_picture(
+        g_draw, 0, 0, GBA_WIDTH, GBA_HEIGHT, &g_video_picture
+    );
+    (void)bda_gui_select_draw_object(g_draw, old_object);
+    (void)bda_gui_draw_guard_end();
+    return result;
+}
+
+static void copy_video_to_surface(const void *data, size_t pitch)
+{
+    const u8 *source = (const u8 *)data;
+    u8 *destination = (u8 *)g_surface_pixels;
+    u32 row;
+
+    for (row = 0u; row < GBA_HEIGHT; ++row) {
+        memcpy(
+            destination + row * GBA_WIDTH * sizeof(u16),
+            source + row * pitch,
+            GBA_WIDTH * sizeof(u16)
+        );
+    }
+}
+
 static void video_callback(
     const void *data, unsigned width, unsigned height, size_t pitch
 )
 {
-    void *old_object;
     int video_result;
     u32 perf_start;
     if (!data || width != GBA_WIDTH || height != GBA_HEIGHT ||
-        pitch < GBA_WIDTH * sizeof(u16)) {
+        pitch < GBA_WIDTH * sizeof(u16) || !g_surface_pixels) {
         return;
     }
     ++g_video_callbacks;
     if (g_video_callbacks == 1u) {
         log_text("VIDEO_CB_BEGIN");
     }
-    g_video_picture.source_pixels = data;
+    copy_video_to_surface(data, pitch);
+    g_video_picture.source_pixels = g_surface_pixels;
     perf_start = bbk_perf_counter_read();
-    (void)bda_gui_draw_guard_begin();
-    old_object = bda_gui_select_draw_object(g_draw, g_draw_object);
-    video_result = bda_gui_render_picture(
-        g_draw, 0, 0, GBA_WIDTH, GBA_HEIGHT, &g_video_picture
-    );
-    (void)bda_gui_select_draw_object(g_draw, old_object);
-    (void)bda_gui_draw_guard_end();
+    video_result = present_direct_surface();
+    if (video_result != 0) {
+        video_result = render_video_with_firmware();
+    }
     bbk_perf_accumulator_add(
         &g_perf_video, perf_start, bbk_perf_counter_read()
     );
@@ -438,15 +506,18 @@ static void render_controls(void)
     );
     g_controls_picture.source_pixels = g_controls_pixels;
     perf_start = bbk_perf_counter_read();
-    (void)bda_gui_draw_guard_begin();
-    old_object = bda_gui_select_draw_object(g_draw, g_draw_object);
-    result = bda_gui_render_picture(
-        g_draw, 0, GBA_HEIGHT,
-        GBA_CONTROLS_WIDTH, GBA_CONTROLS_HEIGHT,
-        &g_controls_picture
-    );
-    (void)bda_gui_select_draw_object(g_draw, old_object);
-    (void)bda_gui_draw_guard_end();
+    result = present_direct_surface();
+    if (result != 0) {
+        (void)bda_gui_draw_guard_begin();
+        old_object = bda_gui_select_draw_object(g_draw, g_draw_object);
+        result = bda_gui_render_picture(
+            g_draw, 0, GBA_HEIGHT,
+            GBA_CONTROLS_WIDTH, GBA_CONTROLS_HEIGHT,
+            &g_controls_picture
+        );
+        (void)bda_gui_select_draw_object(g_draw, old_object);
+        (void)bda_gui_draw_guard_end();
+    }
     bbk_perf_accumulator_add(
         &g_perf_controls, perf_start, bbk_perf_counter_read()
     );
@@ -463,7 +534,6 @@ static void render_controls(void)
 
 static void render_full_surface_if_needed(void)
 {
-    void *old_object;
     int result;
     u32 perf_start;
 
@@ -475,13 +545,10 @@ static void render_full_surface_if_needed(void)
         return;
     }
     perf_start = bbk_perf_counter_read();
-    (void)bda_gui_draw_guard_begin();
-    old_object = bda_gui_select_draw_object(g_draw, g_draw_object);
-    result = bda_gui_render_picture(
-        g_draw, 0, 0, GBA_WIDTH, GBA_HEIGHT, &g_video_picture
-    );
-    (void)bda_gui_select_draw_object(g_draw, old_object);
-    (void)bda_gui_draw_guard_end();
+    result = present_direct_surface();
+    if (result != 0) {
+        result = render_video_with_firmware();
+    }
     bbk_perf_accumulator_add(
         &g_perf_video, perf_start, bbk_perf_counter_read()
     );
@@ -923,6 +990,11 @@ static void service_help_page(void)
                 "HELP_PAGE_DRAW_REACQUIRE=PASS" :
                 "HELP_PAGE_DRAW_REACQUIRE=ERROR"
         );
+        log_text(
+            acquire_direct_framebuffer() ?
+                "HELP_PAGE_FRAMEBUFFER_REACQUIRE=PASS" :
+                "HELP_PAGE_FRAMEBUFFER_REACQUIRE=FALLBACK"
+        );
         g_full_redraw = 1;
     }
     if (audio_was_open) {
@@ -987,6 +1059,12 @@ static void service_rom_change(void)
                 log_value("ROM_CHANGE_SAVE=", (u32)save_result);
                 shutdown_core();
                 g_video_picture.source_pixels = 0;
+                if (g_surface_pixels) {
+                    memset(
+                        g_surface_pixels, 0,
+                        GBA_WIDTH * GBA_HEIGHT * sizeof(*g_surface_pixels)
+                    );
+                }
                 if (initialize_core()) {
                     log_text("ROM_CHANGE_LOAD=PASS");
                 } else {
@@ -1024,6 +1102,11 @@ static void service_rom_change(void)
                 "ROM_CHANGE_DRAW_REACQUIRE=PASS" :
                 "ROM_CHANGE_DRAW_REACQUIRE=ERROR"
         );
+        log_text(
+            acquire_direct_framebuffer() ?
+                "ROM_CHANGE_FRAMEBUFFER_REACQUIRE=PASS" :
+                "ROM_CHANGE_FRAMEBUFFER_REACQUIRE=FALLBACK"
+        );
         g_full_redraw = 1;
     }
     if (audio_was_open) {
@@ -1051,7 +1134,7 @@ static int initialize_window(bda_frame_desc_t *descriptor)
 #if defined(BBK_GPSP_CPU_TEST)
     descriptor->title = "GBA SAVE BUS TEST R40";
 #else
-    descriptor->title = "GBA PERF R44";
+    descriptor->title = "GBA DIRECT FB R45";
 #endif
     descriptor->wndproc = app_window_proc;
     descriptor->height = SCREEN_WIDTH;
@@ -1069,11 +1152,26 @@ static int initialize_window(bda_frame_desc_t *descriptor)
     if (!g_draw || !g_draw_object || (s32)(u32)g_draw_object == -1) {
         return 0;
     }
-    g_controls_pixels = (u16 *)malloc(
-        GBA_CONTROLS_WIDTH * GBA_CONTROLS_HEIGHT * sizeof(*g_controls_pixels)
+    g_surface_pixels = (u16 *)malloc(
+        SCREEN_WIDTH * SCREEN_HEIGHT * sizeof(*g_surface_pixels)
     );
-    if (!g_controls_pixels) {
+    if (!g_surface_pixels || ((u32)g_surface_pixels & 3u) != 0u) {
         return 0;
+    }
+    memset(
+        g_surface_pixels, 0,
+        SCREEN_WIDTH * SCREEN_HEIGHT * sizeof(*g_surface_pixels)
+    );
+    g_controls_pixels = g_surface_pixels + GBA_WIDTH * GBA_HEIGHT;
+    if (acquire_direct_framebuffer()) {
+        log_text("FRAMEBUFFER_ACQUIRE=PASS");
+        log_value(
+            "FRAMEBUFFER_ROTATE_180=", g_framebuffer.rotate_180
+        );
+        log_text("VIDEO_OUTPUT=DIRECT_FRAMEBUFFER");
+    } else {
+        log_text("FRAMEBUFFER_ACQUIRE=FALLBACK");
+        log_text("VIDEO_OUTPUT=FIRMWARE_PICTURE");
     }
     render_controls();
     return 1;
@@ -1225,10 +1323,12 @@ static void log_runtime_progress(void)
 
     if (snprintf(
             line, sizeof(line),
-            "RUN core=%u emu_fps100=%u video_fps100=%u video_cb=%u video_ok=%u video_err=%u sound=%u vol=%u att=%u skip=%u audio=%u short=%u drop=%u queue=%u aud_hz=%u bp=%u raw_poll=%u raw_evt=%u raw_max=%u raw_cap=%u raw_ignored=%u touch_down=%u touch_move=%u touch_up=%u touch_pos=%u hit_change=%u ctrl_draw=%u jit_rom=%u jit_ram=%u jit_rf=%u jit_wf=%u jit_pf=%u rom_pg=%u rom_last=%u rom_stage=%u rom_safe=%u perf_wall=%llu perf_c25=%u perf_run_pm=%u perf_cpu_pm=%u perf_video_pm=%u perf_audio_pm=%u perf_pcm_pm=%u perf_rom_pm=%u perf_ctrl_pm=%u perf_vmax=%u perf_amax=%u perf_rmax=%u",
+            "RUN core=%u emu_fps100=%u video_fps100=%u video_cb=%u video_ok=%u video_err=%u fb=%u fb_present=%u fb_err=%u fb_acq=%u sound=%u vol=%u att=%u skip=%u audio=%u short=%u drop=%u queue=%u aud_hz=%u bp=%u raw_poll=%u raw_evt=%u raw_max=%u raw_cap=%u raw_ignored=%u touch_down=%u touch_move=%u touch_up=%u touch_pos=%u hit_change=%u ctrl_draw=%u jit_rom=%u jit_ram=%u jit_rf=%u jit_wf=%u jit_pf=%u rom_pg=%u rom_last=%u rom_stage=%u rom_safe=%u perf_wall=%llu perf_c25=%u perf_run_pm=%u perf_cpu_pm=%u perf_video_pm=%u perf_audio_pm=%u perf_pcm_pm=%u perf_rom_pm=%u perf_ctrl_pm=%u perf_vmax=%u perf_amax=%u perf_rmax=%u",
             g_core_frames, emu_fps100, video_fps100,
             g_video_callbacks, g_video_frames,
-            g_video_submit_errors, g_audio_level != 0u,
+            g_video_submit_errors, (u32)g_framebuffer_enabled,
+            g_framebuffer_presents, g_framebuffer_present_errors,
+            g_framebuffer_acquire_attempts, g_audio_level != 0u,
             g_audio_level, g_audio.effective_attenuation,
             g_frameskip_interval, g_audio.blocks_written,
             g_audio.short_writes, g_audio.dropped_samples, g_audio.queued_samples,
@@ -1297,11 +1397,14 @@ static void close_window(bda_gui_message_t *message)
     int release_result;
 
     if (!g_frame) {
-        free(g_controls_pixels);
+        free(g_surface_pixels);
+        g_surface_pixels = 0;
         g_controls_pixels = 0;
         return;
     }
     g_touch_mask = 0u;
+    g_framebuffer_enabled = 0;
+    memset(&g_framebuffer, 0, sizeof(g_framebuffer));
     log_text("WINDOW_STOP_BEGIN");
     stop_result = bda_gui_frame_stop(g_frame);
     log_value("WINDOW_STOP_RESULT=", (u32)stop_result);
@@ -1327,7 +1430,8 @@ static void close_window(bda_gui_message_t *message)
     bda_gui_close_frame(g_frame);
     log_text("WINDOW_CLOSE_RETURN=PASS");
     g_frame = 0;
-    free(g_controls_pixels);
+    free(g_surface_pixels);
+    g_surface_pixels = 0;
     g_controls_pixels = 0;
 }
 
@@ -1361,6 +1465,8 @@ int bda_main(void)
     g_draw = 0;
     g_draw_owner = 0;
     g_draw_object = 0;
+    memset(&g_framebuffer, 0, sizeof(g_framebuffer));
+    g_surface_pixels = 0;
     g_controls_pixels = 0;
     g_touch_mask = 0u;
     g_touch_x = 0u;
@@ -1396,10 +1502,14 @@ int bda_main(void)
     g_exit_requested = 0;
     g_detached = 0;
     g_core_loaded = 0;
+    g_framebuffer_enabled = 0;
     g_core_frames = 0u;
     g_video_frames = 0u;
     g_video_callbacks = 0u;
     g_video_submit_errors = 0u;
+    g_framebuffer_acquire_attempts = 0u;
+    g_framebuffer_presents = 0u;
+    g_framebuffer_present_errors = 0u;
     g_controls_submit_errors = 0u;
     g_audio_backpressure_skips = 0u;
     g_controls_render_attempts = 0u;
@@ -1447,8 +1557,9 @@ int bda_main(void)
     log_text("BBK9588 GBA SAVE BUS TEST R40");
     log_text("BUILD_ID=DRC_R1_ROM_PAGE_SAVE_BUS_TEST_R40");
 #else
-    log_text("BBK9588 GBA PERF R44");
-    log_text("BUILD_ID=DRC_R1_CP0_PHASE_PROFILE_R44");
+    log_text("BBK9588 GBA DIRECT FB R45");
+    log_text("BUILD_ID=DRC_R1_DIRECT_FRAMEBUFFER_R45");
+    log_text("VIDEO_OUTPUT=DYNAMIC_DIRECT_FRAMEBUFFER_WITH_PICTURE_FALLBACK");
     log_text("HOST_IRQ_WINDOW=UPDATE_GBA_AND_ROM_PAGE_IO_FULL_CONTEXT");
     log_text("HOST_IRQ_CONTEXT=GP_S0_S7_FP_RA");
     log_text("HOST_POLL_CONTEXT=LIBRETRO_FRAME_BOUNDARY");
@@ -1640,6 +1751,9 @@ int bda_main(void)
     log_value("VIDEO_FRAMES=", g_video_frames);
     log_value("VIDEO_CALLBACKS=", g_video_callbacks);
     log_value("VIDEO_SUBMIT_ERRORS=", g_video_submit_errors);
+    log_value("FRAMEBUFFER_ACQUIRE_ATTEMPTS=", g_framebuffer_acquire_attempts);
+    log_value("FRAMEBUFFER_PRESENTS=", g_framebuffer_presents);
+    log_value("FRAMEBUFFER_PRESENT_ERRORS=", g_framebuffer_present_errors);
     log_value("CONTROLS_SUBMIT_ERRORS=", g_controls_submit_errors);
     log_value("AUDIO_BLOCKS=", g_audio.blocks_written);
     log_value("AUDIO_DROPPED=", g_audio.dropped_samples);
