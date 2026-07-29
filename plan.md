@@ -350,9 +350,9 @@
   不依赖固定固件地址；每个显示帧将顶部 GBA 画面与底部控制层组成 `240x320 RGB565` 后直接
   提交，获取或提交失败才退回 picture 接口。9588 模拟器使用 16 MiB Emerald ROM 连续运行
   6191 个逻辑帧，稳定区间平均 `59.77/29.88 FPS`，累计 3098 次 framebuffer present、0 次
-  present 错误，音频 short/drop/backpressure 均为 0，正常退出 `RESULT=PASS`。正式 `GBA.bda`
-  大小 855260 字节，SHA-256
-  `616637e85f818b86f27c1cf22c85a5aa7cd934e01fd76ea1088b3d686504436d`；真机稳定性仍待验证。
+  present 错误，音频 short/drop/backpressure 均为 0，正常退出 `RESULT=PASS`。v0.1.6 Release
+  的 `GBA.bda` 大小 855196 字节，SHA-256
+  `b9655f7c19392fd20d450d214cc4dd8a87fdd732ff2545dadf57862ee0af4509`；真机稳定性仍待验证。
 - 私有 Emerald fixture 已完成新游戏、角色移动、设置时钟和游戏内保存。顶部为原生
   `240x160` 游戏画面，底部为 A/B/L/R/D-pad/Start/Select 触摸控制层；实体方向键也已在
   游戏内验证，不再穿透到 9588 桌面。
